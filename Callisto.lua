@@ -1,30 +1,9 @@
 --!strict
---[[
-	Callisto — single-file UI library
-	Rebuilt from the original instance dump. Visuals are byte-for-byte the same
-	properties; everything else is structure, animation and theming.
-
-	Animation rules honoured throughout:
-	  - NO element ever changes size for aesthetic purposes. All feedback is
-	    transparency, colour, position or rotation.
-	  - NO CanvasGroups anywhere: they flatten UIGradients over child text and
-	    have too many rendering caveats. Windows and popups fade through the
-	    Fader, which cascades transparency tweens over every descendant.
-	  - The slider fill DOES resize, instantly and untweened — that is the
-	    value display, not an animation.
-
-	local Callisto = loadstring(game:HttpGet("..."))()
-
-	local Window = Callisto:CreateWindow({ Title = "Callisto", Size = Vector2.new(591, 480) })
-	local Page   = Window:AddPage("General")
-	local Left   = Page:AddSection("Left", "Section #1")
-
-	Left:AddToggle({ Title = "Toggle", Default = false, Callback = print })
-]]
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
+local TextService = game:GetService("TextService")
 local UserInputService = game:GetService("UserInputService")
 
 local LocalPlayer = Players.LocalPlayer
@@ -142,7 +121,9 @@ local function PaintTheme(alpha: number, previous: { [string]: Color3 })
 		end
 		for property, key in next, map do
 			pcall(function()
-				(instance :: any)[property] = previous[key]:Lerp(Callisto.Theme[key], alpha)
+                if previous[key] ~= Callisto.Theme[key] then
+                    (instance :: any)[property] = previous[key]:Lerp(Callisto.Theme[key], alpha)
+                end
 			end)
 		end
 	end
@@ -1184,6 +1165,84 @@ local function BuildColorpicker(holder: Instance, swatch: GuiButton, default: Co
 	}
 end
 
+
+
+local LockedStates = setmetatable({}, { __mode = "k" })
+local LockedScrollers = setmetatable({}, { __mode = "k" })
+
+function Callisto:SetLocked(element: any, locked: boolean)
+    local root = typeof(element) == "Instance" and element or (element.Row or element.Instance)
+    assert(root and root:IsA("GuiObject"), "SetLocked expects a Callisto control or GuiObject")
+
+    if not locked then
+        local state = LockedStates[root]
+        if not state then return element end
+        LockedStates[root] = nil
+        for _, saved in ipairs(state.Objects) do
+            pcall(function()
+                saved.Object.Active = saved.Active
+                saved.Object.Interactable = saved.Interactable
+                if saved.TextEditable ~= nil then
+                    saved.Object.TextEditable = saved.TextEditable
+                end
+            end)
+        end
+        for _, scroller in ipairs(state.Scrollers) do
+            local saved = LockedScrollers[scroller]
+            if saved then
+                saved.Count -= 1
+                if saved.Count == 0 then
+                    pcall(function() scroller.Active = saved.Active end)
+                    LockedScrollers[scroller] = nil
+                end
+            end
+        end
+        return element
+    end
+
+    if LockedStates[root] then return element end
+    if typeof(element) == "table" and type(element.Close) == "function" then
+        element.Close()
+    end
+
+    local state = { Objects = {}, Scrollers = {} }
+    local objects = root:GetDescendants()
+    TIS(objects, 1, root)
+    for _, object in ipairs(objects) do
+        if object:IsA("GuiObject") then
+            local saved: any = {
+                Object = object,
+                Active = object.Active,
+                Interactable = object.Interactable,
+            }
+            if object:IsA("TextBox") then saved.TextEditable = object.TextEditable end
+            TIS(state.Objects, saved)
+        end
+    end
+    LockedStates[root] = state
+    for _, saved in ipairs(state.Objects) do
+        saved.Object.Active = false
+        saved.Object.Interactable = false
+        if saved.TextEditable ~= nil then saved.Object.TextEditable = false end
+    end
+
+    local parent = root.Parent
+    while parent and not parent:IsA("ScreenGui") do
+        if parent:IsA("ScrollingFrame") then
+            local saved = LockedScrollers[parent]
+            if not saved then
+                saved = { Active = parent.Active, Count = 0 }
+                LockedScrollers[parent] = saved
+            end
+            saved.Count += 1
+            parent.Active = false
+            TIS(state.Scrollers, parent)
+        end
+        parent = parent.Parent
+    end
+    return element
+end
+
 --=============================================================================
 -- Section — holds elements
 --=============================================================================
@@ -1240,6 +1299,20 @@ end
 function Section:_Order(): number
 	self._order = (self._order or 0) + 1
 	return self._order
+end
+
+
+
+function Section:AddDivider()
+    local line = Add("Frame", {
+        Parent = self.Content,
+        Name = "Divider",
+        Size = UD2(1, 0, 0, 1),
+        BorderSizePixel = 0,
+        LayoutOrder = self:_Order(),
+    })
+    Bind(line, { BackgroundColor3 = "Border" })
+    return { Instance = line }
 end
 
 --== Button ===================================================================
@@ -1441,83 +1514,173 @@ end
 --== Keybind ==================================================================
 
 local KeybindBlacklist = {
-	[EKC.Unknown] = true,
+    [EKC.Unknown] = true,
+}
+
+local KeybindAliases = {
+    LEFTCONTROL = "LCTRL", RIGHTCONTROL = "RCTRL",
+    LEFTSHIFT = "LSHIFT", RIGHTSHIFT = "RSHIFT",
+    LEFTALT = "LALT", RIGHTALT = "RALT",
+    PAGEUP = "PGUP", PAGEDOWN = "PGDN", CAPSLOCK = "CAPS",
 }
 
 function Section:AddKeybind(options: { [string]: any })
-	local _, left = self:_Row(options.Title or "Keybind")
-	local current: EnumItem? = options.Default
-	local binding = false
+    local row, left, right, title = self:_Row(options.Title or "Keybind")
+    local current: EnumItem? = options.Default
+    if current == EKC.Unknown then current = nil end
+    local binding, hovering = false, false
 
-	local button = Text(left, {
-		ClassName = "TextButton",
-		LayoutOrder = 2,
-		-- the dump had Active = false (static mockup); it must be true to click
-		Active = true,
-		Selectable = false,
-		TextTruncate = ETT.SplitWord,
-		Name = "Keybind",
-		Text = current and current.Name:upper() or "NONE",
-		TextTransparency = 0.5,
-		AutomaticSize = AT.XY,
-		AutoButtonColor = false,
-	})
+    row.AutomaticSize = AT.None
+    row.Size = UD2(1, 0, 0, 24)
+    left.AutomaticSize = AT.None
+    title.AutomaticSize = AT.None
+    title.Size = UFS(1, 1)
+    title.TextXAlignment = TXA.Left
+    title.TextTruncate = ETT.AtEnd
+    right.AutomaticSize = AT.None
+    right.AnchorPoint = V2(1, 0.5)
+    right.Position = UFS(1, 0.5)
 
-	local function render()
-		button.Text = binding and "..." or (current and current.Name:upper() or "NONE")
-		Tween(button, Anim.Fast, { TextTransparency = binding and 0 or 0.5 })
-	end
+    local surface = Add("Frame", {
+        Parent = right,
+        Name = "ThemedKeybind",
+        Size = UFO(28, 24),
+        BackgroundColor3 = RGB(255, 255, 255),
+        BackgroundTransparency = 0.12,
+        BorderSizePixel = 0,
+    })
+    Corner(surface, 5)
+    local gradient = Add("UIGradient", { Parent = surface, Rotation = 90 })
+    BindGradient(gradient, { { 0, "Accent" }, { 1, "AccentDark" } })
+    local stroke = Stroke(surface, "AccentLight", true)
+    stroke.Transparency = 0.25
 
-	Connect(button.MouseButton1Click, function()
-		binding = true
-		render()
-	end)
+    local button = Text(surface, {
+        ClassName = "TextButton",
+        Name = "Keybind",
+        Active = true,
+        Selectable = false,
+        AutoButtonColor = false,
+        Size = UFS(1, 1),
+        Text = "",
+        TextTransparency = 1,
+    })
+    local keyLabel = Text(button, {
+        Name = "KeyLabel",
+        Text = "",
+        TextColor3 = RGB(255, 255, 255),
+        TextTransparency = 0,
+        TextSize = 14,
+        Size = UFS(1, 1),
+        TextWrapped = false,
+        TextScaled = false,
+        TextTruncate = ETT.None,
+        TextXAlignment = TXA.Center,
+        ZIndex = button.ZIndex + 1,
+    })
 
-	Hover(button, function(hovering)
-		if not binding then
-			Tween(button, Anim.Fast, { TextTransparency = hovering and 0.2 or 0.5 })
-		end
-	end)
+    local measureVersion = 0
+    local lastMeasured: string? = nil
+    local function applyWidth(width: number)
+        if not surface.Parent then return end
+        local pixels = math.max(28, math.ceil(width) + 16)
+        surface.Size = UFO(pixels, 24)
+        right.Size = UFO(pixels, 24)
+        left.Size = UD2(1, -pixels - 8, 1, 0)
+    end
+    local function fitKeyText()
+        measureVersion += 1
+        local version = measureVersion
+        local text = keyLabel.Text
+        local ok, bounds = pcall(function()
+            return TextService:GetTextSize(text, keyLabel.TextSize, Enum.Font.Gotham, V2(100000, 100000))
+        end)
+        if ok then applyWidth(bounds.X) else applyWidth(#text * keyLabel.TextSize * 0.6) end
+        task.spawn(function()
+            local params = Instance.new("GetTextBoundsParams")
+            local success, measured = pcall(function()
+                params.Text = text
+                params.Font = keyLabel.FontFace
+                params.Size = keyLabel.TextSize
+                params.Width = 100000
+                params.RichText = false
+                return TextService:GetTextBoundsAsync(params)
+            end)
+            params:Destroy()
+            if success and version == measureVersion then applyWidth(measured.X) end
+        end)
+    end
+    Connect(keyLabel:GetPropertyChangedSignal("FontFace"), fitKeyText)
+    Connect(keyLabel:GetPropertyChangedSignal("TextSize"), fitKeyText)
+    Connect(keyLabel:GetPropertyChangedSignal("Text"), fitKeyText)
 
-	Connect(UserInputService.InputBegan, function(input, processed)
-		if binding then
-			if input.UserInputType == UIT.Keyboard and not KeybindBlacklist[input.KeyCode] then
-				-- Backspace clears the bind. `x and nil or y` cannot express this
-				-- in Lua (nil is falsy), so it has to be a real branch.
-				if input.KeyCode == EKC.Backspace then
-					current = nil
-				else
-					current = input.KeyCode
-				end
-				binding = false
-				render()
-				if options.Flag then
-					Callisto.Flags[options.Flag] = current
-				end
-			end
-			return
-		end
+    local function isLocked(): boolean
+        return not row.Interactable or not button.Interactable
+    end
+    local function render()
+        local name = current and current.Name:upper() or "NONE"
+        local display = binding and "PRESS KEY" or (KeybindAliases[name] or name)
+        button.Text = display
+        keyLabel.Text = display
+        if lastMeasured ~= display then
+            lastMeasured = display
+            fitKeyText()
+        end
+        local selected = current ~= nil
+        local highlighted = hovering or binding
+        surface.BackgroundTransparency = highlighted and 0 or (selected and 0.12 or 1)
+        stroke.Transparency = highlighted and 0 or (selected and 0.25 or 1)
+        if options.Flag then Callisto.Flags[options.Flag] = current end
+    end
 
-		if processed or not current then
-			return
-		end
-		if input.UserInputType == UIT.Keyboard and input.KeyCode == current and options.Callback then
-			task.spawn(options.Callback, current)
-		end
-	end)
+    Connect(button.MouseButton1Click, function()
+        if isLocked() then return end
+        binding = true
+        render()
+    end)
+    Hover(button, function(over)
+        hovering = over and not isLocked()
+        render()
+    end)
+    local function onLockChanged()
+        if isLocked() then binding, hovering = false, false end
+        render()
+    end
+    Connect(row:GetPropertyChangedSignal("Interactable"), onLockChanged)
+    Connect(button:GetPropertyChangedSignal("Interactable"), onLockChanged)
 
-	render()
+    Connect(UserInputService.InputBegan, function(input, processed)
+        if isLocked() then return end
+        if binding then
+            if input.UserInputType == UIT.Keyboard and not KeybindBlacklist[input.KeyCode] then
+                if input.KeyCode == EKC.Backspace then current = nil else current = input.KeyCode end
+                binding = false
+                render()
+            end
+            return
+        end
+        if processed or not current then return end
+        if input.UserInputType == UIT.Keyboard and input.KeyCode == current and options.Callback then
+            task.spawn(options.Callback, current)
+        end
+    end)
+    render()
 
-	return {
-		Instance = button,
-		Get = function()
-			return current
-		end,
-		Set = function(_, key: EnumItem?)
-			current = key
-			render()
-		end,
-	}
+    return {
+        Instance = button,
+        Row = row,
+        Background = surface,
+        Label = keyLabel,
+        Get = function() return current end,
+        Set = function(_, key: EnumItem?)
+            assert(key == nil or (typeof(key) == "EnumItem" and key.EnumType == EKC),
+                "Keybind:Set expects an Enum.KeyCode or nil")
+            current = key
+            if current == EKC.Unknown then current = nil end
+            binding = false
+            render()
+        end,
+    }
 end
 
 --== Slider ===================================================================
@@ -2656,6 +2819,8 @@ function Callisto:Unload()
 	table.clear(ColorRegistry)
 	table.clear(GradientRegistry)
 	table.clear(self.Flags)
+	table.clear(LockedStates)
+	table.clear(LockedScrollers)
 	Fader.Clear()
 end
 
