@@ -87,6 +87,7 @@ Callisto.Theme = table.clone(DefaultTheme)
 
 -- instance -> { property = themeKey }
 local ColorRegistry: { [Instance]: { [string]: string } } = {}
+local BorderStates: { [Instance]: any } = {}
 -- gradient -> { {time, themeKey}, ... }
 local GradientRegistry: { [UIGradient]: { { any } } } = {}
 -- the running theme transition, if any
@@ -121,7 +122,13 @@ local function PaintTheme(alpha: number, previous: { [string]: Color3 })
 		end
 		for property, key in next, map do
 			pcall(function()
-                if previous[key] ~= Callisto.Theme[key] then
+                local borderState = BorderStates[instance]
+                if property == "Color" and borderState then
+                    local border = previous.Border:Lerp(Callisto.Theme.Border, alpha)
+                    local accent = previous.Accent:Lerp(Callisto.Theme.Accent, alpha)
+                    local target: any = instance
+                    target[property] = border:Lerp(accent, borderState.Weight.Value)
+                elseif previous[key] ~= Callisto.Theme[key] then
                     (instance :: any)[property] = previous[key]:Lerp(Callisto.Theme[key], alpha)
                 end
 			end)
@@ -247,6 +254,22 @@ local function Connect(signal: RBXScriptSignal, callback)
 	local connection = signal:Connect(callback)
 	TIS(Callisto.Connections, connection)
 	return connection
+end
+
+local function SetBorderActive(stroke: UIStroke, active: boolean)
+    local state = BorderStates[stroke]
+    if not state then
+        local weight = Add("NumberValue", { Parent = stroke, Value = 0 })
+        state = { Weight = weight }
+        BorderStates[stroke] = state
+        Connect(weight:GetPropertyChangedSignal("Value"), function()
+            if stroke.Parent then
+                stroke.Color = Callisto.Theme.Border:Lerp(Callisto.Theme.Accent, weight.Value)
+            end
+        end)
+    end
+    if state.Tween then state.Tween:Cancel() end
+    state.Tween = Tween(state.Weight, Anim.Base, { Value = active and 1 or 0 })
 end
 
 -- Fires callback(hovering: boolean).
@@ -1387,7 +1410,7 @@ function Section:AddButton(options: { [string]: any })
 
 		Hover(button, function(hovering)
 			Tween(label, Anim.Base, { TextTransparency = hovering and 0 or 0.5 })
-			Tween(stroke, Anim.Base, { Color = hovering and Callisto.Theme.Accent or Callisto.Theme.Border })
+			SetBorderActive(stroke, hovering)
 		end)
 		Press(button)
 
@@ -1685,223 +1708,299 @@ end
 
 --== Slider ===================================================================
 
+local function IsFiniteNumber(value: any): boolean
+    return type(value) == "number" and value == value and math.abs(value) < math.huge
+end
+
+local function NormalizeNumber(value: number, minimum: number, maximum: number, decimals: number): number
+    value = MC(value, minimum, maximum)
+    local multiplier = 10 ^ decimals
+    local scaled = value * multiplier
+    local rounded = IsFiniteNumber(scaled) and MF(scaled + 0.5) / multiplier or value
+    return MC(rounded, minimum, maximum)
+end
+
+local function FormatNumber(value: number, decimals: number): string
+    local text = string.format("%." .. decimals .. "f", value)
+    if decimals > 0 then text = text:gsub("0+$", ""):gsub("%.$", "") end
+    return tonumber(text) == 0 and "0" or text
+end
+
+local function IsNumberDraft(text: string, negatives: boolean, decimals: number): boolean
+    if not negatives and text:find("-", 1, true) then return false end
+    if decimals == 0 and text:find(".", 1, true) then return false end
+    return text:match("^%-?%d*%.?%d*$") ~= nil
+end
+
 function Section:AddSlider(options: { [string]: any })
-	local minimum = options.Min or 0
-	local maximum = options.Max or 100
-	local decimals = options.Decimals or 0
-	local suffix = options.Suffix or "%"
-	local value = MC(options.Default or minimum, minimum, maximum)
+    local minimum = options.Min or 0
+    local maximum = options.Max or 100
+    local decimals = options.Decimals or 0
+    assert(IsFiniteNumber(minimum) and IsFiniteNumber(maximum) and minimum <= maximum, "Invalid slider range")
+    assert(IsFiniteNumber(decimals) and decimals % 1 == 0 and decimals >= 0 and decimals <= 10, "Decimals must be between 0 and 10")
+    local initial = tonumber(options.Default) or minimum
+    local value = NormalizeNumber(IsFiniteNumber(initial) and initial or minimum, minimum, maximum, decimals)
+    local suffix = options.Suffix or "%"
+    local editing, dragging = false, false
 
-	local container = Add("Frame", {
-		Parent = self.Content,
-		Name = "Slider",
-		BackgroundTransparency = 1,
-		Size = UFS(1, 0),
-		AutomaticSize = AT.Y,
-		BorderSizePixel = 0,
-		LayoutOrder = self:_Order(),
-	})
-	List(container, { Padding = UD(0, 5) })
+    local container = Add("Frame", {
+        Parent = self.Content, Name = "Slider", BackgroundTransparency = 1,
+        Size = UFS(1, 0), AutomaticSize = AT.Y, BorderSizePixel = 0, LayoutOrder = self:_Order(),
+    })
+    List(container, { Padding = UD(0, 5) })
+    local changed = Add("BindableEvent", { Parent = container, Name = "ValueChanged" })
+    local textHolder = Add("Frame", {
+        Parent = container, Name = "TextHolder", BackgroundTransparency = 1,
+        Size = UFS(1, 0), AutomaticSize = AT.Y, BorderSizePixel = 0,
+    })
+    List(textHolder, { FillDirection = FD.Horizontal, HorizontalFlex = UFA.SpaceBetween, Padding = UD(0, 7) })
+    local title = Text(textHolder, {
+        Name = "Title", LayoutOrder = 1, Text = options.Title or "slider",
+        TextTruncate = ETT.SplitWord, AutomaticSize = AT.XY,
+    })
+    Padding(title, -3, -1)
+    local valueHolder = Add("Frame", {
+        Parent = textHolder, Name = "ValueHolder", LayoutOrder = 2,
+        BackgroundTransparency = 1, Size = UFO(0, 0), AutomaticSize = AT.XY, BorderSizePixel = 0,
+    })
+    List(valueHolder, { FillDirection = FD.Horizontal, VerticalAlignment = VFA.Center, Padding = UD(0, 0) })
+    local current = Text(valueHolder, {
+        ClassName = "TextButton", Name = "Current", LayoutOrder = 1, Text = "",
+        AutoButtonColor = false, Active = true, AutomaticSize = AT.XY,
+    })
+    Padding(current, -3, -1)
+    local editor = Text(valueHolder, {
+        ClassName = "TextBox", Name = "ValueInput", LayoutOrder = 1, Text = "",
+        Visible = false, Active = true, ClearTextOnFocus = false,
+        MultiLine = false, TextWrapped = false, TextTruncate = ETT.None, AutomaticSize = AT.XY,
+    })
+    Add("UISizeConstraint", { Parent = editor, MinSize = V2(12, 0) })
+    Padding(editor, -3, -1)
+    local suffixLabel = Text(valueHolder, {
+        Name = "Suffix", LayoutOrder = 2, Text = suffix, AutomaticSize = AT.XY, Active = false,
+    })
+    Padding(suffixLabel, -3, -1)
+    local track = Add("TextButton", {
+        Parent = container, LayoutOrder = 1, Name = "Button", Text = "",
+        AutoButtonColor = false, Size = UD2(1, 0, 0, 16), BorderSizePixel = 0,
+    })
+    Corner(track, 5)
+    local trackStroke = Stroke(track, "Border", true)
+    SurfaceGradient(track)
+    local fill = Add("Frame", {
+        Parent = track, Name = "Fill", Size = UD2(0, 0, 1, 0), BorderSizePixel = 0,
+    })
+    Corner(fill, 5)
+    AccentGradient(fill)
+    Shadow(fill, 0.65, "Accent")
 
-	local textHolder = Add("Frame", {
-		Parent = container,
-		AnchorPoint = V2(0, 0.5),
-		Name = "TextHolder",
-		BackgroundTransparency = 1,
-		Position = UFS(0, 0.5),
-		Size = UFS(1, 0),
-		AutomaticSize = AT.XY,
-		BorderSizePixel = 0,
-	})
-	List(textHolder, {
-		FillDirection = FD.Horizontal,
-		HorizontalFlex = UFA.SpaceBetween,
-		Padding = UD(0, 7),
-	})
-
-	local title = Text(textHolder, {
-		Name = "Title",
-		LayoutOrder = 1,
-		Text = options.Title or "slider",
-		TextTruncate = ETT.SplitWord,
-		AutomaticSize = AT.XY,
-	})
-	Padding(title, -3, -1)
-
-	local current = Text(textHolder, {
-		Name = "Current",
-		LayoutOrder = 1,
-		Text = "0" .. suffix,
-		TextTruncate = ETT.SplitWord,
-		AutomaticSize = AT.XY,
-	})
-	Padding(current, -3, -1)
-
-	local track = Add("TextButton", {
-		Parent = container,
-		LayoutOrder = 1,
-		Text = "",
-		AutoButtonColor = false,
-		Name = "Button",
-		Size = UD2(1, 0, 0, 16),
-		BorderSizePixel = 0,
-	})
-	Corner(track, 5)
-	local trackStroke = Stroke(track, "Border", true)
-	SurfaceGradient(track)
-
-	local fill = Add("Frame", {
-		Parent = track,
-		Name = "Fill",
-		Size = UD2(0, 0, 1, 0),
-		BorderSizePixel = 0,
-	})
-	Corner(fill, 5)
-	AccentGradient(fill)
-	Shadow(fill, 0.65, "Accent")
-
-	local function round(number: number): number
-		local multiplier = 10 ^ decimals
-		return MF(number * multiplier + 0.5) / multiplier
-	end
-
-	-- The fill's Size is the value readout — data, not decoration — so it is
-	-- set instantly, never tweened. Dragging updates it every frame anyway.
-	local function render()
-		local progress = (value - minimum) / (maximum - minimum)
-		fill.Size = UD2(progress, 0, 1, 0)
-		current.Text = tostring(round(value)) .. suffix
-	end
-
-	local function set(newValue: number, silent: boolean?)
-		value = MC(round(newValue), minimum, maximum)
-		render()
-		if options.Flag then
-			Callisto.Flags[options.Flag] = value
-		end
-		if options.Callback and not silent then
-			task.spawn(options.Callback, value)
-		end
-	end
-
-	local dragging = false
-	local function updateFromInput(position: Vector3 | Vector2)
-		local progress = MC((position.X - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
-		set(minimum + (maximum - minimum) * progress)
-	end
-
-	Connect(track.InputBegan, function(input)
-		if input.UserInputType == UIT.MouseButton1 or input.UserInputType == UIT.Touch then
-			dragging = true
-			updateFromInput(input.Position)
-		end
-	end)
-	Connect(UserInputService.InputEnded, function(input)
-		if input.UserInputType == UIT.MouseButton1 or input.UserInputType == UIT.Touch then
-			dragging = false
-		end
-	end)
-	Connect(UserInputService.InputChanged, function(input)
-		if dragging and (input.UserInputType == UIT.MouseMovement or input.UserInputType == UIT.Touch) then
-			updateFromInput(input.Position)
-		end
-	end)
-
-	-- hover feedback: stroke tint only
-	Hover(track, function(hovering)
-		Tween(trackStroke, Anim.Base, {
-			Color = hovering and Callisto.Theme.Accent or Callisto.Theme.Border,
-		})
-	end)
-
-	set(value, true)
-
-	return {
-		Instance = container,
-		Get = function()
-			return value
-		end,
-		Set = function(_, newValue: number)
-			set(newValue)
-		end,
-	}
+    local function render()
+        local progress = maximum == minimum and 0 or (value - minimum) / (maximum - minimum)
+        fill.Size = UD2(progress, 0, 1, 0)
+        current.Text = FormatNumber(value, decimals)
+        if not editing then editor.Text = current.Text end
+    end
+    local function set(newValue: number, silent: boolean?)
+        if not IsFiniteNumber(newValue) then return value end
+        local previous = value
+        value = NormalizeNumber(newValue, minimum, maximum, decimals)
+        render()
+        if options.Flag then Callisto.Flags[options.Flag] = value end
+        if previous ~= value then changed:Fire(value) end
+        if options.Callback and not silent then task.spawn(options.Callback, value) end
+        return value
+    end
+    local function isLocked(): boolean
+        return not container.Interactable or not track.Interactable
+    end
+    local function finishEditing(commit: boolean)
+        if not editing then return end
+        local parsed = tonumber(editor.Text)
+        editing = false
+        editor.Visible = false
+        current.Visible = true
+        if editor:IsFocused() then editor:ReleaseFocus() end
+        if commit and not isLocked() and IsFiniteNumber(parsed) then set(parsed) else render() end
+    end
+    local lastClick = -math.huge
+    Connect(current.MouseButton1Click, function()
+        if isLocked() then return end
+        local now = os.clock()
+        if now - lastClick <= 0.3 then
+            lastClick = -math.huge
+            editing = true
+            dragging = false
+            editor.Text = FormatNumber(value, decimals)
+            current.Visible = false
+            editor.Visible = true
+            editor:CaptureFocus()
+            editor.CursorPosition = #editor.Text + 1
+            editor.SelectionStart = -1
+        else
+            lastClick = now
+        end
+    end)
+    local accepted = editor.Text
+    local filtering = false
+    Connect(editor:GetPropertyChangedSignal("Text"), function()
+        if filtering then return end
+        if IsNumberDraft(editor.Text, minimum < 0, decimals) then
+            accepted = editor.Text
+        else
+            filtering = true
+            editor.Text = accepted
+            editor.CursorPosition = #editor.Text + 1
+            filtering = false
+        end
+    end)
+    Connect(editor.FocusLost, function() finishEditing(true) end)
+    Connect(editor.InputBegan, function(input)
+        if input.KeyCode == EKC.Escape then finishEditing(false) end
+    end)
+    local function stopIfLocked()
+        if isLocked() then dragging = false; finishEditing(false) end
+    end
+    Connect(container:GetPropertyChangedSignal("Interactable"), stopIfLocked)
+    Connect(track:GetPropertyChangedSignal("Interactable"), stopIfLocked)
+    local function updateFromInput(position: Vector3 | Vector2)
+        if isLocked() or track.AbsoluteSize.X <= 0 then return end
+        local progress = MC((position.X - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+        set(minimum + (maximum - minimum) * progress)
+    end
+    Connect(track.InputBegan, function(input)
+        if isLocked() then return end
+        if input.UserInputType == UIT.MouseButton1 or input.UserInputType == UIT.Touch then
+            finishEditing(true)
+            dragging = true
+            updateFromInput(input.Position)
+        end
+    end)
+    Connect(UserInputService.InputEnded, function(input)
+        if input.UserInputType == UIT.MouseButton1 or input.UserInputType == UIT.Touch then dragging = false end
+    end)
+    Connect(UserInputService.InputChanged, function(input)
+        if dragging and (input.UserInputType == UIT.MouseMovement or input.UserInputType == UIT.Touch) then
+            updateFromInput(input.Position)
+        end
+    end)
+    Hover(track, function(over) SetBorderActive(trackStroke, over) end)
+    set(value, true)
+    return {
+        Instance = container, ValueLabel = current, ValueInput = editor, SuffixLabel = suffixLabel,
+        Min = minimum, Max = maximum, Decimals = decimals, Changed = changed.Event,
+        Get = function() return value end,
+        Set = function(_, newValue: number) return set(newValue) end,
+    }
 end
 
 --== Input ====================================================================
 
 function Section:AddInput(options: { [string]: any })
-	local container = Add("Frame", {
-		Parent = self.Content,
-		Name = "Input",
-		BackgroundTransparency = 1,
-		Size = UFS(1, 0),
-		AutomaticSize = AT.Y,
-		BorderSizePixel = 0,
-		LayoutOrder = self:_Order(),
-	})
-	List(container, { VerticalAlignment = VFA.Center, Padding = UD(0, 3) })
-	Padding(container, 1)
-
-	local title = Text(container, {
-		Name = "Title",
-		Text = options.Title or "Input",
-		TextTransparency = 0.3,
-		Position = UFO(21, 0),
-		TextTruncate = ETT.SplitWord,
-		AutomaticSize = AT.XY,
-	})
-	Padding(title, -5, -1)
-
-	local box = Add("Frame", {
-		Parent = container,
-		LayoutOrder = 1,
-		Active = true,
-		Selectable = true,
-		Name = "Button",
-		Size = UD2(1, 0, 0, 25),
-		BorderSizePixel = 0,
-	})
-	Corner(box, 5)
-	local stroke = Stroke(box, "Border", true)
-	Padding(box, 0, 0, 7, 7)
-	Shadow(box, 0.65)
-	SurfaceGradient(box)
-
-	local input = Text(box, {
-		ClassName = "TextBox",
-		Name = "TextLabel",
-		Text = options.Default or "",
-		Size = UFS(1, 1),
-		Selectable = false,
-		TextXAlignment = TXA.Left,
-		TextTruncate = ETT.SplitWord,
-		Active = false,
-		PlaceholderText = options.Placeholder or "something here....",
-		ClearTextOnFocus = options.ClearOnFocus ~= false,
-	})
-
-	Connect(input.Focused, function()
-		Tween(stroke, Anim.Base, { Color = Callisto.Theme.Accent })
-	end)
-	Connect(input.FocusLost, function(enter)
-		Tween(stroke, Anim.Base, { Color = Callisto.Theme.Border })
-		if options.Flag then
-			Callisto.Flags[options.Flag] = input.Text
-		end
-		if options.Callback and (enter or not options.OnEnter) then
-			task.spawn(options.Callback, input.Text, enter)
-		end
-	end)
-
-	return {
-		Instance = container,
-		Get = function()
-			return input.Text
-		end,
-		Set = function(_, value: string)
-			input.Text = value
-		end,
-	}
+    local slider = options.Slider or options.LinkedSlider
+    local numeric = options.NumbersOnly == true or slider ~= nil
+    if slider then
+        assert(type(slider) == "table" and type(slider.Get) == "function" and type(slider.Set) == "function"
+            and slider.Changed, "Slider must be a Callisto slider")
+    end
+    local minimum = slider and slider.Min or options.Min or -math.huge
+    local maximum = slider and slider.Max or options.Max or math.huge
+    local decimals = slider and slider.Decimals or options.Decimals or 0
+    if numeric then
+        assert(type(minimum) == "number" and minimum == minimum and type(maximum) == "number"
+            and maximum == maximum and minimum <= maximum, "Invalid input range")
+        assert(IsFiniteNumber(decimals) and decimals % 1 == 0 and decimals >= 0 and decimals <= 10,
+            "Decimals must be between 0 and 10")
+    end
+    local committed = numeric and (slider and slider.Get() or tonumber(options.Default) or 0) or nil
+    if numeric then
+        if not IsFiniteNumber(committed) then committed = 0 end
+        committed = NormalizeNumber(committed, minimum, maximum, decimals)
+    end
+    local container = Add("Frame", {
+        Parent = self.Content, Name = "Input", BackgroundTransparency = 1,
+        Size = UFS(1, 0), AutomaticSize = AT.Y, BorderSizePixel = 0, LayoutOrder = self:_Order(),
+    })
+    List(container, { VerticalAlignment = VFA.Center, Padding = UD(0, 3) })
+    Padding(container, 1)
+    local title = Text(container, {
+        Name = "Title", Text = options.Title or "Input", TextTransparency = 0.3, Position = UFO(21, 0),
+        TextXAlignment = TXA.Left, TextTruncate = ETT.SplitWord, AutomaticSize = AT.XY,
+    })
+    Padding(title, -5, -1)
+    local box = Add("Frame", {
+        Parent = container, LayoutOrder = 1, Active = true, Selectable = true, Name = "Button",
+        Size = UD2(1, 0, 0, 25), BorderSizePixel = 0,
+    })
+    Corner(box, 5)
+    local stroke = Stroke(box, "Border", true)
+    Padding(box, 0, 0, 7, 7)
+    Shadow(box, 0.65)
+    SurfaceGradient(box)
+    local clearOnFocus = options.ClearOnFocus ~= false
+    if numeric then clearOnFocus = options.ClearOnFocus == true end
+    local input = Text(box, {
+        ClassName = "TextBox", Name = "TextLabel",
+        Text = numeric and FormatNumber(committed, decimals) or tostring(options.Default or ""),
+        Size = UFS(1, 1), Selectable = false, TextXAlignment = TXA.Left, TextTruncate = ETT.SplitWord,
+        Active = false, PlaceholderText = options.Placeholder or "something here....",
+        ClearTextOnFocus = clearOnFocus, MultiLine = false,
+    })
+    local accepted = input.Text
+    local filtering = false
+    local function putText(text: string)
+        filtering = true
+        input.Text = text
+        accepted = text
+        filtering = false
+    end
+    local function syncFlag()
+        if options.Flag then Callisto.Flags[options.Flag] = input.Text end
+    end
+    local function setNumeric(value: any, updateSlider: boolean)
+        local number = tonumber(value)
+        if not IsFiniteNumber(number) then number = committed end
+        number = NormalizeNumber(number, minimum, maximum, decimals)
+        if slider and updateSlider and slider.Get() ~= number then slider:Set(number) end
+        if slider then number = slider.Get() end
+        committed = number
+        putText(FormatNumber(number, decimals))
+        syncFlag()
+    end
+    Connect(input:GetPropertyChangedSignal("Text"), function()
+        if not numeric or filtering then return end
+        if IsNumberDraft(input.Text, minimum < 0, decimals) then
+            accepted = input.Text
+        else
+            putText(accepted)
+            input.CursorPosition = #input.Text + 1
+        end
+    end)
+    Connect(input.Focused, function() SetBorderActive(stroke, true) end)
+    Connect(input.FocusLost, function(enter)
+        SetBorderActive(stroke, false)
+        if not container.Interactable or not input.Interactable then
+            if numeric then setNumeric(committed, false) end
+            return
+        end
+        if numeric then setNumeric(input.Text, true) else syncFlag() end
+        if options.Callback and (enter or not options.OnEnter) then task.spawn(options.Callback, input.Text, enter) end
+    end)
+    if slider then
+        Connect(slider.Changed, function(value)
+            committed = value
+            putText(FormatNumber(value, decimals))
+            syncFlag()
+        end)
+    end
+    if numeric then syncFlag() end
+    return {
+        Instance = container, Input = input,
+        Get = function() return input.Text end,
+        GetNumber = function() return tonumber(input.Text) end,
+        Set = function(_, value: any)
+            if numeric then setNumeric(value, true) else input.Text = tostring(value) end
+        end,
+    }
 end
 
 --== Dropdown =================================================================
@@ -2113,7 +2212,7 @@ function Section:AddDropdown(options: { [string]: any })
 	end)
 
 	Hover(button, function(hovering)
-		Tween(stroke, Anim.Base, { Color = hovering and Callisto.Theme.Accent or Callisto.Theme.Border })
+		SetBorderActive(stroke, hovering)
 	end)
 
 	Connect(UserInputService.InputBegan, function(input, processed)
@@ -2817,6 +2916,7 @@ function Callisto:Unload()
 	end
 
 	table.clear(ColorRegistry)
+	table.clear(BorderStates)
 	table.clear(GradientRegistry)
 	table.clear(self.Flags)
 	table.clear(LockedStates)
