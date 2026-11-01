@@ -2006,19 +2006,22 @@ end
 --== Dropdown =================================================================
 
 function Section:AddDropdown(options: { [string]: any })
-	local values = options.Values or options.Options or {}
+	local valuesSource = options.Values or options.Options or {}
+    local currentValues: { string } = {}
 	local multi = options.Multi or options.MultiSelect or false
 	local selected: { string } = {}
 
-	if options.Default then
-		if typeof(options.Default) == "table" then
-			for _, item in next, options.Default do
-				TIS(selected, item)
-			end
-		else
-			TIS(selected, options.Default)
-		end
-	end
+    local function toLabel(value: any): string
+        if typeof(value) == "Instance" then return value.Name end
+        return tostring(value)
+    end
+    if options.Default ~= nil then
+        if typeof(options.Default) == "table" then
+            for _, item in ipairs(options.Default) do TIS(selected, toLabel(item)) end
+        else
+            TIS(selected, toLabel(options.Default))
+        end
+    end
 
 	local container = Add("Frame", {
 		Parent = self.Content,
@@ -2136,11 +2139,20 @@ function Section:AddDropdown(options: { [string]: any })
 	end
 
 	local open = false
+    local loading = false
+    local reloadValues: any
 	local function setOpen(shouldOpen: boolean)
 		if open == shouldOpen then
 			return
 		end
-		open = shouldOpen
+        if shouldOpen then
+            if loading or not container.Interactable or not button.Interactable then return end
+            loading = true
+            reloadValues(true)
+            loading = false
+            if not container.Parent or not container.Interactable or not button.Interactable then return end
+        end
+        open = shouldOpen
 
 		-- Size is decided before the popup appears and never animated. It is
 		-- computed from fixed entry metrics — TextBounds (and therefore
@@ -2172,7 +2184,13 @@ function Section:AddDropdown(options: { [string]: any })
 			ZIndex = 41,
 		})
 
-		Connect(entry.MouseButton1Click, function()
+        local connections = {}
+        local function connectEntry(event, callback)
+            local connection = Connect(event, callback)
+            TIS(connections, connection)
+        end
+        connectEntry(entry.MouseButton1Click, function()
+            if not container.Interactable or not button.Interactable or not entry.Interactable then return end
 			local index = TF(selected, value)
 			if multi then
 				if index then
@@ -2190,19 +2208,112 @@ function Section:AddDropdown(options: { [string]: any })
 			end
 		end)
 
-		Hover(entry, function(hovering)
-			if TF(selected, value) then
-				return
-			end
-			Tween(entry, Anim.Fast, { TextTransparency = hovering and 0.2 or 0.5 })
-		end)
-
-		TIS(entries, { Button = entry, Value = value })
+        local function hoverEntry(hovering)
+            if TF(selected, value) then return end
+            Tween(entry, Anim.Fast, { TextTransparency = hovering and 0.2 or 0.5 })
+        end
+        connectEntry(entry.MouseEnter, function() hoverEntry(true) end)
+        connectEntry(entry.MouseLeave, function() hoverEntry(false) end)
+        TIS(entries, { Button = entry, Value = value, Connections = connections })
 	end
 
-	for _, value in ipairs(values) do
-		AddOption(tostring(value))
-	end
+    local function readValues()
+        local result = valuesSource
+        if type(result) == "function" then result = result() end
+        assert(type(result) == "table", "Dropdown Values must be a table or a function returning a table")
+        local count = 0
+        for _ in pairs(result) do count += 1 end
+        local array = true
+        for key in pairs(result) do
+            if type(key) ~= "number" or key % 1 ~= 0 or key < 1 or key > count then
+                array = false
+                break
+            end
+        end
+        local labels, seen = {}, {}
+        local function add(value)
+            local label = toLabel(value)
+            if not seen[label] then seen[label] = true; TIS(labels, label) end
+        end
+        if array then
+            for index = 1, count do add(result[index]) end
+        else
+            for key in pairs(result) do add(key) end
+            table.sort(labels, function(a, b)
+                local lowerA, lowerB = a:lower(), b:lower()
+                return lowerA == lowerB and a < b or lowerA < lowerB
+            end)
+        end
+        return labels
+    end
+    local function clearEntries()
+        local removed = {}
+        for _, entry in ipairs(entries) do
+            for _, connection in ipairs(entry.Connections) do
+                connection:Disconnect()
+                removed[connection] = true
+            end
+            entry.Button:Destroy()
+        end
+        table.clear(entries)
+        local write = 1
+        for read = 1, #Callisto.Connections do
+            local connection = Callisto.Connections[read]
+            if not removed[connection] then
+                Callisto.Connections[write] = connection
+                write += 1
+            end
+        end
+        for index = #Callisto.Connections, write, -1 do Callisto.Connections[index] = nil end
+    end
+    reloadValues = function(preserveSelection: boolean)
+        local ok, labels = pcall(readValues)
+        if not ok then
+            warn("[Callisto dropdown: " .. (options.Title or "Dropdown") .. "] " .. tostring(labels))
+            return false
+        end
+        if not container.Parent then return false end
+        local unchanged = #labels == #currentValues
+        if unchanged then
+            for index, label in ipairs(labels) do
+                if currentValues[index] ~= label then unchanged = false; break end
+            end
+        end
+        local retained = {}
+        if preserveSelection then
+            for _, value in ipairs(selected) do
+                if TF(labels, value) and not TF(retained, value) then
+                    TIS(retained, value)
+                    if not multi then break end
+                end
+            end
+        end
+        selected = retained
+        currentValues = labels
+        options.Values = table.clone(labels)
+        if unchanged then render(); return true end
+        local state = Fader.State[popup]
+        if state ~= nil and state ~= "shown" then Fader.In(popup, TI(0)) end
+        clearEntries()
+        for _, label in ipairs(labels) do AddOption(label) end
+        inner.CanvasPosition = V2(0, 0)
+        render()
+        if state == "hidden" then
+            Fader.State[popup] = "shown"
+            Fader.Out(popup, TI(0))
+        elseif state ~= nil then
+            Fader.State[popup] = "shown"
+            Fader.Out(popup, TI(0))
+            Fader.In(popup, TI(0))
+        end
+        if open then
+            local height = math.min(#entries * ENTRY_HEIGHT + math.max(#entries - 1, 0) * ENTRY_GAP + 11,
+                options.MaxHeight or 160)
+            popup.Size = UFO(MR(button.AbsoluteSize.X), height)
+        end
+        return true
+    end
+    reloadValues(true)
 
 	-- prime the fader with the fully-built option list (see colorpicker note)
 	Fader.Out(popup, TI(0))
@@ -2235,33 +2346,24 @@ function Section:AddDropdown(options: { [string]: any })
 		Get = function()
 			return multi and table.clone(selected) or selected[1]
 		end,
-		Set = function(_, value)
-			selected = typeof(value) == "table" and table.clone(value) or { value }
-			render()
-		end,
-		Refresh = function(_, newValues: { string })
-			-- restore the shell to rest before rebuilding, so the re-prime
-			-- below captures true rest values rather than mid-fade ones
-			local hidden = Fader.State[popup] == "hidden"
-			if hidden then
-				Fader.In(popup, TI(0))
-			end
-
-			for _, entry in next, entries do
-				entry.Button:Destroy()
-			end
-			table.clear(entries)
-			selected = {}
-			for _, value in ipairs(newValues) do
-				AddOption(tostring(value))
-			end
-			render()
-
-			if hidden then
-				Fader.State[popup] = "shown"
-				Fader.Out(popup, TI(0))
-			end
-		end,
+        Set = function(_, value)
+            selected = {}
+            if typeof(value) == "table" then
+                for _, item in ipairs(value) do
+                    local label = toLabel(item)
+                    if not TF(selected, label) then TIS(selected, label) end
+                    if not multi then break end
+                end
+            elseif value ~= nil then
+                TIS(selected, toLabel(value))
+            end
+            render()
+        end,
+        Refresh = function(_, newValues)
+            if newValues ~= nil then valuesSource = newValues end
+            return reloadValues(newValues == nil)
+        end,
+        GetValues = function() return table.clone(currentValues) end,
 		Close = function()
 			setOpen(false)
 		end,
