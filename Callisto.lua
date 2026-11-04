@@ -66,6 +66,19 @@ Callisto.Flags = {} :: { [string]: any }
 Callisto.Windows = {} :: { any }
 Callisto.Connections = {} :: { RBXScriptConnection }
 
+local ConfigEntries: { [string]: any } = {}
+local ConfigOrder: { any } = {}
+local ConfigManager: any = nil
+
+local function SetFlag(flag: string, value: any)
+    local previous = Callisto.Flags[flag]
+    Callisto.Flags[flag] = value
+    if previous ~= value then
+        local entry = ConfigEntries[flag]
+        if entry and entry.Sync then entry.Sync() end
+    end
+end
+
 --=============================================================================
 -- Theme
 --=============================================================================
@@ -89,7 +102,7 @@ Callisto.Theme = table.clone(DefaultTheme)
 local ColorRegistry: { [Instance]: { [string]: string } } = {}
 local BorderStates: { [Instance]: any } = {}
 -- gradient -> { {time, themeKey}, ... }
-local GradientRegistry: { [UIGradient]: { { any } } } = {}
+local GradientRegistry: { [UIGradient]: { Stops: { { any } }, Signature: string } } = {}
 -- the running theme transition, if any
 local ThemeTransition: RBXScriptConnection? = nil
 
@@ -103,49 +116,61 @@ local function Bind(instance: Instance, map: { [string]: string })
 end
 
 local function BindGradient(gradient: UIGradient, stops: { { any } })
-	GradientRegistry[gradient] = stops
-	local keypoints = {}
-	for _, stop in next, stops do
-		TIS(keypoints, CSK(stop[1], Callisto.Theme[stop[2]]))
-	end
-	gradient.Color = CS(keypoints)
+    local signature = {}
+    local keypoints = {}
+    for _, stop in ipairs(stops) do
+        TIS(signature, tostring(stop[1]) .. ":" .. stop[2])
+        TIS(keypoints, CSK(stop[1], Callisto.Theme[stop[2]]))
+    end
+    GradientRegistry[gradient] = { Stops = stops, Signature = table.concat(signature, "|") }
+    gradient.Color = CS(keypoints)
 end
 
 -- Paints every registered property/gradient at `alpha` between the previous
 -- theme snapshot and the current one. Gradients are rebuilt keypoint-by-
 -- keypoint, which is the only way to animate UIGradient.Color at all.
-local function PaintTheme(alpha: number, previous: { [string]: Color3 })
-	for instance, map in next, ColorRegistry do
-		if not instance.Parent then
-			ColorRegistry[instance] = nil
-			continue
-		end
-		for property, key in next, map do
-			pcall(function()
-                local borderState = BorderStates[instance]
-                if property == "Color" and borderState then
-                    local border = previous.Border:Lerp(Callisto.Theme.Border, alpha)
-                    local accent = previous.Accent:Lerp(Callisto.Theme.Accent, alpha)
-                    local target: any = instance
-                    target[property] = border:Lerp(accent, borderState.Weight.Value)
-                elseif previous[key] ~= Callisto.Theme[key] then
-                    (instance :: any)[property] = previous[key]:Lerp(Callisto.Theme[key], alpha)
+local function PaintTheme(alpha: number, previous: { [string]: Color3 }, changed: { [string]: boolean })
+    local colors = {}
+    for key in pairs(changed) do colors[key] = previous[key]:Lerp(Callisto.Theme[key], alpha) end
+    local border = colors.Border or Callisto.Theme.Border
+    local accent = colors.Accent or Callisto.Theme.Accent
+    for instance, map in next, ColorRegistry do
+        if not instance.Parent then
+            ColorRegistry[instance] = nil
+            BorderStates[instance] = nil
+            continue
+        end
+        local borderState = BorderStates[instance]
+        for property, key in next, map do
+            if property == "Color" and borderState then
+                if changed.Border or (changed.Accent and borderState.Weight.Value > 0) then
+                    pcall(function() (instance :: any)[property] = border:Lerp(accent, borderState.Weight.Value) end)
                 end
-			end)
-		end
-	end
-
-	for gradient, stops in next, GradientRegistry do
-		if not gradient.Parent then
-			GradientRegistry[gradient] = nil
-			continue
-		end
-		local keypoints = {}
-		for _, stop in next, stops do
-			TIS(keypoints, CSK(stop[1], previous[stop[2]]:Lerp(Callisto.Theme[stop[2]], alpha)))
-		end
-		gradient.Color = CS(keypoints)
-	end
+            elseif changed[key] then
+                pcall(function() (instance :: any)[property] = colors[key] end)
+            end
+        end
+    end
+    local sequences = {}
+    for gradient, binding in next, GradientRegistry do
+        if not gradient.Parent then GradientRegistry[gradient] = nil; continue end
+        local repaint = false
+        for _, stop in ipairs(binding.Stops) do
+            if changed[stop[2]] then repaint = true; break end
+        end
+        if repaint then
+            local sequence = sequences[binding.Signature]
+            if not sequence then
+                local keypoints = {}
+                for _, stop in ipairs(binding.Stops) do
+                    TIS(keypoints, CSK(stop[1], colors[stop[2]] or Callisto.Theme[stop[2]]))
+                end
+                sequence = CS(keypoints)
+                sequences[binding.Signature] = sequence
+            end
+            gradient.Color = sequence
+        end
+    end
 end
 
 --[[
@@ -178,13 +203,18 @@ function Callisto:SetTheme(theme: { [string]: Color3 }, animate: boolean?)
 		self.Theme.ForegroundLight = theme.Foreground:Lerp(RGB(255, 255, 255), 0.03)
 	end
 
-	if ThemeTransition then
-		ThemeTransition:Disconnect()
-		ThemeTransition = nil
-	end
+    local changed = {}
+    for key, color in pairs(self.Theme) do
+        if previous[key] ~= color then changed[key] = true end
+    end
+    if next(changed) == nil then return end
+    if ThemeTransition then
+        ThemeTransition:Disconnect()
+        ThemeTransition = nil
+    end
 
 	if animate == false then
-		PaintTheme(1, previous)
+		PaintTheme(1, previous, changed)
 		return
 	end
 
@@ -192,7 +222,7 @@ function Callisto:SetTheme(theme: { [string]: Color3 }, animate: boolean?)
 	ThemeTransition = RunService.RenderStepped:Connect(function(dt)
 		elapsed += dt
 		local progress = MC(elapsed / 0.25, 0, 1)
-		PaintTheme(1 - (1 - progress) ^ 3, previous) -- cubic ease-out
+		PaintTheme(1 - (1 - progress) ^ 3, previous, changed) -- cubic ease-out
 		if progress >= 1 and ThemeTransition then
 			ThemeTransition:Disconnect()
 			ThemeTransition = nil
@@ -451,64 +481,55 @@ end
 -- while dragging (and briefly afterwards, to settle), so it never fights the
 -- position tweens the open/close animations play on the same target.
 local function MakeDraggable(handle: GuiObject, target: GuiObject)
-	local dragging, dragStart, startPosition = false, Vector3.zero, UD2()
-	local goal = target.Position
-	local settling = false
-
-	Connect(handle.InputBegan, function(input)
-		if input.UserInputType == UIT.MouseButton1 or input.UserInputType == UIT.Touch then
-			dragging = true
-			settling = true
-			dragStart = input.Position
-			startPosition = target.Position
-			goal = startPosition
-
-			local connection
-			connection = input.Changed:Connect(function()
-				if input.UserInputState == Enum.UserInputState.End then
-					dragging = false
-					connection:Disconnect()
-				end
-			end)
-		end
-	end)
-
-	Connect(UserInputService.InputChanged, function(input)
-		if not dragging then
-			return
-		end
-		if input.UserInputType ~= UIT.MouseMovement and input.UserInputType ~= UIT.Touch then
-			return
-		end
-		local delta = input.Position - dragStart
-		goal = UD2(
-			startPosition.X.Scale,
-			startPosition.X.Offset + delta.X,
-			startPosition.Y.Scale,
-			startPosition.Y.Offset + delta.Y
-		)
-	end)
-
-	Connect(RunService.RenderStepped, function(dt)
-		if not settling then
-			return
-		end
-
-		local position = target.Position
-		local settled = not dragging
-			and math.abs(goal.X.Offset - position.X.Offset) < 0.5
-			and math.abs(goal.Y.Offset - position.Y.Offset) < 0.5
-			and math.abs(goal.X.Scale - position.X.Scale) < 0.001
-			and math.abs(goal.Y.Scale - position.Y.Scale) < 0.001
-
-		if settled then
-			target.Position = goal
-			settling = false
-			return
-		end
-
-		target.Position = position:Lerp(goal, MC(dt * 20, 0, 1))
-	end)
+    local dragging, dragStart, startPosition = false, Vector3.zero, UD2()
+    local goal = target.Position
+    local frameConnection, inputConnection
+    local function disconnect(connection)
+        if not connection then return end
+        connection:Disconnect()
+        local index = TF(Callisto.Connections, connection)
+        if index then TR(Callisto.Connections, index) end
+    end
+    local function step(dt)
+        if not target.Parent then disconnect(frameConnection); frameConnection = nil; return end
+        local position = target.Position
+        local settled = not dragging
+            and math.abs(goal.X.Offset - position.X.Offset) < 0.5
+            and math.abs(goal.Y.Offset - position.Y.Offset) < 0.5
+            and math.abs(goal.X.Scale - position.X.Scale) < 0.001
+            and math.abs(goal.Y.Scale - position.Y.Scale) < 0.001
+        if settled then
+            target.Position = goal
+            disconnect(frameConnection)
+            frameConnection = nil
+            return
+        end
+        target.Position = position:Lerp(goal, MC(dt * 20, 0, 1))
+    end
+    Connect(handle.InputBegan, function(input)
+        if input.UserInputType == UIT.MouseButton1 or input.UserInputType == UIT.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPosition = target.Position
+            goal = startPosition
+            disconnect(inputConnection)
+            inputConnection = Connect(input.Changed, function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                    disconnect(inputConnection)
+                    inputConnection = nil
+                end
+            end)
+            if not frameConnection then frameConnection = Connect(RunService.RenderStepped, step) end
+        end
+    end)
+    Connect(UserInputService.InputChanged, function(input)
+        if not dragging then return end
+        if input.UserInputType ~= UIT.MouseMovement and input.UserInputType ~= UIT.Touch then return end
+        local delta = input.Position - dragStart
+        goal = UD2(startPosition.X.Scale, startPosition.X.Offset + delta.X,
+            startPosition.Y.Scale, startPosition.Y.Offset + delta.Y)
+    end)
 end
 
 -- User-driven resizing. This changes Size, but it is direct manipulation of
@@ -523,10 +544,12 @@ local function MakeResizable(handle: GuiButton, target: GuiObject, minimum: Vect
 			startSize = target.AbsoluteSize
 
 			local connection
-			connection = input.Changed:Connect(function()
+			connection = Connect(input.Changed, function()
 				if input.UserInputState == Enum.UserInputState.End then
 					resizing = false
-					connection:Disconnect()
+                    connection:Disconnect()
+                    local index = TF(Callisto.Connections, connection)
+                    if index then TR(Callisto.Connections, index) end
 				end
 			end)
 		end
@@ -1452,7 +1475,7 @@ function Section:AddToggle(options: { [string]: any })
 
 	local function fire(state: boolean)
 		if flag then
-			Callisto.Flags[flag] = state
+			SetFlag(flag, state)
 		end
 		if options.Callback then
 			options.Callback(state)
@@ -1467,7 +1490,7 @@ function Section:AddToggle(options: { [string]: any })
 	end
 
 	if flag then
-		Callisto.Flags[flag] = options.Default or false
+		SetFlag(flag, options.Default or false)
 	end
 
 	control.Instance.LayoutOrder = 2
@@ -1522,7 +1545,7 @@ function Section:AddColorpicker(options: { [string]: any })
 		options.Alpha or 0,
 		function(color, alpha)
 			if flag then
-				Callisto.Flags[flag] = color
+				SetFlag(flag, color)
 			end
 			if options.Callback then
 				options.Callback(color, alpha)
@@ -1603,7 +1626,6 @@ function Section:AddKeybind(options: { [string]: any })
     })
 
     local measureVersion = 0
-    local lastMeasured: string? = nil
     local function applyWidth(width: number)
         if not surface.Parent then return end
         local pixels = math.max(28, math.ceil(width) + 16)
@@ -1645,15 +1667,11 @@ function Section:AddKeybind(options: { [string]: any })
         local display = binding and "PRESS KEY" or (KeybindAliases[name] or name)
         button.Text = display
         keyLabel.Text = display
-        if lastMeasured ~= display then
-            lastMeasured = display
-            fitKeyText()
-        end
         local selected = current ~= nil
         local highlighted = hovering or binding
         surface.BackgroundTransparency = highlighted and 0 or (selected and 0.12 or 1)
         stroke.Transparency = highlighted and 0 or (selected and 0.25 or 1)
-        if options.Flag then Callisto.Flags[options.Flag] = current end
+        if options.Flag then SetFlag(options.Flag, current) end
     end
 
     Connect(button.MouseButton1Click, function()
@@ -1805,7 +1823,7 @@ function Section:AddSlider(options: { [string]: any })
         local previous = value
         value = NormalizeNumber(newValue, minimum, maximum, decimals)
         render()
-        if options.Flag then Callisto.Flags[options.Flag] = value end
+        if options.Flag then SetFlag(options.Flag, value) end
         if previous ~= value then changed:Fire(value) end
         if options.Callback and not silent then task.spawn(options.Callback, value) end
         return value
@@ -1954,7 +1972,7 @@ function Section:AddInput(options: { [string]: any })
         filtering = false
     end
     local function syncFlag()
-        if options.Flag then Callisto.Flags[options.Flag] = input.Text end
+        if options.Flag then SetFlag(options.Flag, input.Text) end
     end
     local function setNumeric(value: any, updateSlider: boolean)
         local number = tonumber(value)
@@ -2128,13 +2146,16 @@ function Section:AddDropdown(options: { [string]: any })
 		display.Text = displayText()
 		for _, entry in next, entries do
 			local isSelected = TF(selected, entry.Value) ~= nil
-			Tween(entry.Button, Anim.Fast, {
-				TextTransparency = isSelected and 0 or 0.5,
-				TextColor3 = isSelected and Callisto.Theme.Accent or Callisto.Theme.Text,
-			})
+            local color = isSelected and Callisto.Theme.Accent or Callisto.Theme.Text
+            if entry.Button.TextTransparency ~= (isSelected and 0 or 0.5) or entry.Button.TextColor3 ~= color then
+                Tween(entry.Button, Anim.Fast, {
+                    TextTransparency = isSelected and 0 or 0.5,
+                    TextColor3 = color,
+                })
+            end
 		end
 		if options.Flag then
-			Callisto.Flags[options.Flag] = multi and table.clone(selected) or selected[1]
+			SetFlag(options.Flag, multi and table.clone(selected) or selected[1])
 		end
 	end
 
@@ -2998,8 +3019,364 @@ function Callisto:CreateWindow(options: { [string]: any }?)
 	return window
 end
 
+do
+    local order = ConfigOrder
+    local applying = 0
+
+    local function equal(a, b)
+        if typeof(a) ~= typeof(b) then return false end
+        if typeof(a) ~= "table" then return a == b end
+        for key, value in pairs(a) do if not equal(value, b[key]) then return false end end
+        for key in pairs(b) do if a[key] == nil then return false end end
+        return true
+    end
+
+    local function finite(value)
+        return type(value) == "number" and value == value and math.abs(value) < math.huge
+    end
+
+    local function read(entry)
+        local value, extra = entry.Control.Get()
+        if entry.Kind == "Colorpicker" then return { Color = value, Alpha = extra or 0 } end
+        if entry.Kind == "Switch" then return extra end
+        return typeof(value) == "table" and table.clone(value) or value
+    end
+
+    local function encode(entry, value)
+        local record = { Kind = entry.Kind }
+        if value == nil then record.None = true
+        elseif entry.Kind == "Keybind" then record.Value = value.Name
+        elseif entry.Kind == "Colorpicker" then
+            record.Value = { value.Color.R, value.Color.G, value.Color.B, value.Alpha }
+        else
+            record.Value = typeof(value) == "table" and table.clone(value) or value
+        end
+        return record
+    end
+
+    local function sync(entry)
+        if applying > 0 then return end
+        local value = read(entry)
+        Callisto.Flags[entry.Flag] = entry.Kind == "Colorpicker" and value.Color or value
+        local record = encode(entry, value)
+        if equal(record, entry.Record) then return end
+        entry.Record = record
+        if ConfigManager and not ConfigManager.Stopped then ConfigManager:_Changed() end
+    end
+
+    local function normalize(entry, value)
+        local kind, opts = entry.Kind, entry.Options
+        if kind == "Toggle" then return type(value) == "boolean", value end
+        if kind == "Slider" then
+            if not finite(value) then return false end
+            return true, MC(value, opts.Min or 0, opts.Max or 100)
+        end
+        if kind == "Input" then return type(value) == "string", value end
+        if kind == "Keybind" then
+            if value == nil or value == EKC.Unknown then return true, nil end
+            return typeof(value) == "EnumItem" and value.EnumType == EKC, value
+        end
+        if kind == "Colorpicker" then
+            if type(value) ~= "table" or typeof(value.Color) ~= "Color3" or not finite(value.Alpha) then return false end
+            return true, { Color = value.Color, Alpha = MC(value.Alpha, 0, 1) }
+        end
+        if kind == "Switch" then
+            if not finite(value) or value % 1 ~= 0 then return false end
+            local item = (opts.Values or {})[value]
+            return item ~= nil and not (type(item) == "table" and item.Disabled), value
+        end
+        if kind == "Dropdown" then
+            local values = entry.Control.GetValues and entry.Control.GetValues() or opts.Values or opts.Options or {}
+            local function exists(item)
+                for _, candidate in ipairs(values) do if tostring(candidate) == item then return true end end
+                return false
+            end
+            if opts.Multi or opts.MultiSelect then
+                if type(value) ~= "table" then return false end
+                local filtered = {}
+                for _, item in ipairs(value) do
+                    if type(item) == "string" and exists(item) and not TF(filtered, item) then TIS(filtered, item) end
+                end
+                return true, filtered
+            end
+            if value == nil then return true, nil end
+            return type(value) == "string" and exists(value), value
+        end
+        return false
+    end
+
+    local function notify(entry)
+        local manager = ConfigManager
+        if not entry.Callback or entry.Kind == "Keybind" or (entry.VIP and manager and not manager:_Premium()) then return end
+        local args
+        if entry.Kind == "Colorpicker" then
+            local value = read(entry)
+            args = table.pack(value.Color, value.Alpha)
+        elseif entry.Kind == "Switch" then args = table.pack(entry.Control.Get())
+        elseif entry.Kind == "Input" then args = table.pack(read(entry), false)
+        else args = table.pack(read(entry)) end
+        task.spawn(function()
+            local ok, err = pcall(entry.Callback, table.unpack(args, 1, args.n))
+            if not ok then warn("[Callisto config callback: " .. entry.Flag .. "] " .. tostring(err)) end
+        end)
+    end
+
+    local methods = {
+        AddToggle = "Toggle", AddSlider = "Slider", AddInput = "Input", AddDropdown = "Dropdown",
+        AddColorpicker = "Colorpicker", AddKeybind = "Keybind", AddSwitch = "Switch",
+    }
+    for method, kind in pairs(methods) do
+        local original = Section[method]
+        Section[method] = function(self, options)
+            if not options.Flag or options.Config == false then return original(self, options) end
+            assert(type(options.Flag) == "string" and options.Flag ~= "", "Flag must be a nonempty string")
+            assert(not ConfigEntries[options.Flag], "Duplicate config Flag: " .. options.Flag)
+            local opts = table.clone(options)
+            local entry = { Flag = opts.Flag, Kind = kind, Options = opts, VIP = opts.VIP == true, Callback = opts.Callback }
+            opts.Callback = function(...)
+                if not entry.Control or applying > 0 then return end
+                local manager = ConfigManager
+                if manager and not manager.Stopped and entry.VIP and not manager:_Premium() then
+                    manager:_Apply(entry, entry.Fallback, false)
+                    return
+                end
+                if kind == "Colorpicker" or kind == "Switch" then sync(entry) end
+                if entry.Callback then entry.Callback(...) end
+            end
+            entry.Control = original(self, opts)
+            entry.NativeSet = entry.Control.Set
+            entry.Fallback = read(entry)
+            if kind == "Toggle" then entry.Fallback = false
+            elseif kind == "Keybind" then entry.Fallback = nil
+            elseif kind == "Dropdown" then entry.Fallback = (opts.Multi or opts.MultiSelect) and {} or nil end
+            entry.Sync = function() sync(entry) end
+            ConfigEntries[entry.Flag] = entry
+            TIS(order, entry)
+            sync(entry)
+            entry.Control.Set = function(control, value, extra)
+                local manager = ConfigManager
+                if manager and not manager.Stopped then
+                    if kind == "Colorpicker" then
+                        local current = read(entry)
+                        value = { Color = value, Alpha = extra == nil and current.Alpha or extra }
+                    end
+                    local ok, err = manager:_Apply(entry, value, true)
+                    if not ok then warn("[Callisto config] " .. tostring(err)) end
+                    return
+                end
+                local results = table.pack(entry.NativeSet(control, value, extra))
+                sync(entry)
+                return table.unpack(results, 1, results.n)
+            end
+            if entry.Control.Refresh then
+                local refresh = entry.Control.Refresh
+                entry.Control.Refresh = function(control, ...)
+                    local results = table.pack(refresh(control, ...))
+                    sync(entry)
+                    return table.unpack(results, 1, results.n)
+                end
+            end
+            if ConfigManager and not ConfigManager.Stopped and entry.VIP and not ConfigManager:_Premium() then
+                ConfigManager:_Apply(entry, entry.Fallback, false)
+            end
+            return entry.Control
+        end
+    end
+
+    function Callisto:CreateConfig(settings)
+        assert(not ConfigManager or ConfigManager.Stopped, "Callisto config is already active")
+        settings = settings or {}
+        local http = game:GetService("HttpService")
+        local folder, filename = settings.Folder or "bxor", settings.File or "config.json"
+        local name = settings.Name or "san-aurie"
+        local delay = settings.SaveDelay or settings.Interval or 0.75
+        assert(type(folder) == "string", "Folder must be a string")
+        assert(type(filename) == "string" and filename:match("^[%w_%-%.]+$") and not filename:find("..", 1, true),
+            "File must be a simple filename")
+        assert(type(name) == "string" and name ~= "", "Name must be a nonempty string")
+        assert(finite(delay) and delay >= 0.05, "SaveDelay must be at least 0.05 seconds")
+        local manager = { Name = name, Path = folder ~= "" and folder .. "/" .. filename or filename,
+            Dirty = true, Ready = false, Stopped = false }
+        local lastSaved, pending, token, lastChange, lastError = nil, nil, 0, 0, nil
+        local loading = false
+        ConfigManager = manager
+
+        function manager:_Premium()
+            local ok, value = pcall(settings.IsPremium or function() return false end)
+            return ok and value == true
+        end
+
+        local function cancelPending()
+            token += 1
+            if pending and task.cancel then pcall(task.cancel, pending) end
+            pending = nil
+        end
+
+        function manager:_Schedule()
+            if self.Stopped or not self.Ready or loading or settings.AutoSave == false or pending then return end
+            local generation = token
+            local flush
+            flush = function()
+                pending = nil
+                if self.Stopped or not self.Ready or generation ~= token then return end
+                local remaining = delay - (os.clock() - lastChange)
+                if remaining > 0.0001 then pending = task.delay(remaining, flush); return end
+                if not self.Dirty then return end
+                local ok, err = self:Save()
+                if not ok and err ~= lastError then warn("[Callisto config] " .. tostring(err)) end
+                lastError = not ok and err or nil
+            end
+            pending = task.delay(delay, flush)
+        end
+
+        function manager:_Changed()
+            if self.Stopped then return end
+            self.Dirty = true
+            lastChange = os.clock()
+            self:_Schedule()
+        end
+
+        function manager:_Apply(entry, value, fireCallback)
+            local permit = not entry.VIP or self:_Premium()
+            if not permit then value = entry.Fallback end
+            local valid, normalized = normalize(entry, value)
+            if not valid then return false, "Invalid value for " .. entry.Flag end
+            if not permit and equal(entry.Record, encode(entry, normalized)) then return true end
+            applying += 1
+            local ok, err = pcall(function()
+                if entry.Kind == "Colorpicker" then entry.NativeSet(entry.Control, normalized.Color, normalized.Alpha)
+                else entry.NativeSet(entry.Control, normalized) end
+            end)
+            applying -= 1
+            if not ok then return false, tostring(err) end
+            sync(entry)
+            if permit and fireCallback then notify(entry) end
+            return true
+        end
+
+        function manager:RefreshAccess()
+            if self.Stopped then return false, "Config manager has stopped" end
+            if not self:_Premium() then
+                for _, entry in ipairs(order) do
+                    if entry.VIP then self:_Apply(entry, entry.Fallback, false) end
+                end
+            end
+            return true
+        end
+
+        local function readDocument()
+            assert(type(isfile) == "function" and type(readfile) == "function", "File APIs are unavailable")
+            if not isfile(manager.Path) then return { Version = 1, Profiles = {} } end
+            local document = http:JSONDecode(readfile(manager.Path))
+            assert(type(document) == "table" and document.Version == 1, "Unsupported config format")
+            if type(document.Profiles) ~= "table" then
+                assert(type(document.Values) == "table", "Unsupported config format")
+                document = { Version = 1, Profiles = { [name] = { Values = document.Values } } }
+            end
+            return document
+        end
+
+        function manager:Save()
+            if self.Stopped then return false, "Config manager has stopped" end
+            cancelPending()
+            self:RefreshAccess()
+            cancelPending()
+            local profile, premium = { Values = {} }, self:_Premium()
+            for _, entry in ipairs(order) do
+                if not entry.VIP or premium then profile.Values[entry.Flag] = entry.Record end
+            end
+            if lastSaved and equal(profile, lastSaved) then self.Dirty = false; self.Ready = true; return true end
+            local ok, err = pcall(function()
+                assert(type(writefile) == "function", "writefile is unavailable")
+                if folder ~= "" then
+                    assert(type(isfolder) == "function" and type(makefolder) == "function", "Folder APIs are unavailable")
+                    if not isfolder(folder) then makefolder(folder) end
+                end
+                local document = readDocument()
+                document.Profiles[name] = profile
+                writefile(self.Path, http:JSONEncode(document))
+            end)
+            if not ok then return false, tostring(err) end
+            lastSaved = profile
+            self.Dirty, self.Ready = false, true
+            return true
+        end
+
+        local function decode(entry, record)
+            if type(record) ~= "table" or record.Kind ~= entry.Kind then return false end
+            if record.None == true then
+                if entry.Kind == "Keybind" or (entry.Kind == "Dropdown"
+                    and not (entry.Options.Multi or entry.Options.MultiSelect)) then return true, nil end
+                return false
+            end
+            local value = record.Value
+            if entry.Kind == "Keybind" then
+                if type(value) ~= "string" then return false end
+                local ok, item = pcall(function() return EKC[value] end)
+                if not ok or typeof(item) ~= "EnumItem" then return false end
+                value = item
+            elseif entry.Kind == "Colorpicker" then
+                if type(value) ~= "table" then return false end
+                for i = 1, 4 do if not finite(value[i]) or value[i] < 0 or value[i] > 1 then return false end end
+                value = { Color = Color3.new(value[1], value[2], value[3]), Alpha = value[4] }
+            end
+            return normalize(entry, value)
+        end
+
+        function manager:Load()
+            if self.Stopped then return false, "Config manager has stopped" end
+            cancelPending()
+            loading = true
+            self:RefreshAccess()
+            local ok, profile = pcall(function()
+                local document = readDocument()
+                local value = document.Profiles[name]
+                if value == nil then return nil end
+                assert(type(value) == "table" and type(value.Values) == "table", "Invalid named config")
+                return value
+            end)
+            if not ok then self.Ready = false; loading = false; return false, tostring(profile) end
+            local restored, skipped = {}, {}
+            if profile then
+                local premium = self:_Premium()
+                for _, entry in ipairs(order) do
+                    local record = profile.Values[entry.Flag]
+                    if record ~= nil and (not entry.VIP or premium) then
+                        local valid, value = decode(entry, record)
+                        if valid then
+                            local applied, err = self:_Apply(entry, value, false)
+                            if applied then TIS(restored, entry) else TIS(skipped, entry.Flag .. ": " .. tostring(err)) end
+                        else TIS(skipped, entry.Flag) end
+                    end
+                end
+            end
+            lastSaved = profile
+            self.Ready, self.Dirty = true, true
+            loading = false
+            for _, entry in ipairs(restored) do notify(entry) end
+            if #skipped > 0 then warn("[Callisto config] Skipped invalid values: " .. table.concat(skipped, ", ")) end
+            self:_Changed()
+            return true, not profile and "No saved config yet" or nil
+        end
+
+        function manager:Stop()
+            if self.Stopped then return end
+            cancelPending()
+            self.Stopped = true
+        end
+
+        self.Config = manager
+        manager:RefreshAccess()
+        return manager
+    end
+end
+
 -- Full teardown: every window, every connection, every theme registration.
 function Callisto:Unload()
+    if ConfigManager and not ConfigManager.Stopped then
+        if ConfigManager.Ready then ConfigManager:Save() end
+        ConfigManager:Stop()
+    end
 	if ThemeTransition then
 		ThemeTransition:Disconnect()
 		ThemeTransition = nil
@@ -3021,6 +3398,10 @@ function Callisto:Unload()
 	table.clear(BorderStates)
 	table.clear(GradientRegistry)
 	table.clear(self.Flags)
+	table.clear(ConfigEntries)
+	table.clear(ConfigOrder)
+    ConfigManager = nil
+    self.Config = nil
 	table.clear(LockedStates)
 	table.clear(LockedScrollers)
 	Fader.Clear()
