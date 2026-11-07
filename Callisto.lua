@@ -69,6 +69,8 @@ Callisto.Connections = {} :: { RBXScriptConnection }
 local ConfigEntries: { [string]: any } = {}
 local ConfigOrder: { any } = {}
 local ConfigManager: any = nil
+local CallbackContexts: { [thread]: any } = {}
+local ActiveTweens: { [Tween]: RBXScriptConnection } = {}
 
 local function SetFlag(flag: string, value: any)
     local previous = Callisto.Flags[flag]
@@ -275,9 +277,16 @@ local Anim = {
 }
 
 local function Tween(instance: Instance, info: TweenInfo, goal: { [string]: any }): Tween
-	local tween = TweenService:Create(instance, info, goal)
-	tween:Play()
-	return tween
+    local tween = TweenService:Create(instance, info, goal)
+    local connection
+    connection = tween.Completed:Connect(function()
+        if connection then connection:Disconnect() end
+        ActiveTweens[tween] = nil
+        task.defer(function() pcall(function() tween:Destroy() end) end)
+    end)
+    ActiveTweens[tween] = connection
+    tween:Play()
+    return tween
 end
 
 local function Connect(signal: RBXScriptSignal, callback)
@@ -1146,14 +1155,17 @@ local function BuildColorpicker(holder: Instance, swatch: GuiButton, default: Co
 	end
 
 	BindTrack(hueBar, function(position)
+        if hue == position.X then return end
 		hue = position.X
 		render()
 	end)
 	BindTrack(alphaBar, function(position)
+        if alpha == position.Y then return end
 		alpha = position.Y
 		render()
 	end)
 	BindTrack(sv, function(position)
+        if saturation == position.X and value == 1 - position.Y then return end
 		saturation = position.X
 		value = 1 - position.Y
 		render()
@@ -2817,6 +2829,10 @@ end
 -- Removes this window only. Connections are library-wide, so they are left
 -- alone here; use Callisto:Unload() to tear everything down.
 function Window:Destroy()
+    if #Callisto.Windows == 1 and Callisto.Windows[1] == self then
+        Callisto:Unload()
+        return
+    end
 	local index = TF(Callisto.Windows, self)
 	if index then
 		TR(Callisto.Windows, index)
@@ -3105,6 +3121,33 @@ do
         return false
     end
 
+    local function dispatch(entry, args)
+        local parent = CallbackContexts[coroutine.running()]
+        if parent and parent[entry] then return end
+        if entry.CallbackRunning and entry.Worker and coroutine.status(entry.Worker) == "dead" then
+            entry.CallbackRunning = false
+        end
+        entry.PendingCallback = { Args = args, Context = parent }
+        if entry.CallbackRunning then return end
+        entry.CallbackRunning = true
+        task.spawn(function()
+            local worker = coroutine.running()
+            entry.Worker = worker
+            while entry.PendingCallback do
+                local job = entry.PendingCallback
+                entry.PendingCallback = nil
+                local context = job.Context and table.clone(job.Context) or {}
+                context[entry] = true
+                CallbackContexts[worker] = context
+                local ok, err = pcall(entry.Callback, table.unpack(job.Args, 1, job.Args.n))
+                CallbackContexts[worker] = nil
+                if not ok then warn("[Callisto callback: " .. entry.Flag .. "] " .. tostring(err)) end
+            end
+            entry.CallbackRunning = false
+            entry.Worker = nil
+        end)
+    end
+
     local function notify(entry)
         local manager = ConfigManager
         if not entry.Callback or entry.Kind == "Keybind" or (entry.VIP and manager and not manager:_Premium()) then return end
@@ -3115,10 +3158,7 @@ do
         elseif entry.Kind == "Switch" then args = table.pack(entry.Control.Get())
         elseif entry.Kind == "Input" then args = table.pack(read(entry), false)
         else args = table.pack(read(entry)) end
-        task.spawn(function()
-            local ok, err = pcall(entry.Callback, table.unpack(args, 1, args.n))
-            if not ok then warn("[Callisto config callback: " .. entry.Flag .. "] " .. tostring(err)) end
-        end)
+        dispatch(entry, args)
     end
 
     local methods = {
@@ -3141,7 +3181,7 @@ do
                     return
                 end
                 if kind == "Colorpicker" or kind == "Switch" then sync(entry) end
-                if entry.Callback then entry.Callback(...) end
+                if entry.Callback then dispatch(entry, table.pack(...)) end
             end
             entry.Control = original(self, opts)
             entry.NativeSet = entry.Control.Set
@@ -3241,7 +3281,7 @@ do
             if not permit then value = entry.Fallback end
             local valid, normalized = normalize(entry, value)
             if not valid then return false, "Invalid value for " .. entry.Flag end
-            if not permit and equal(entry.Record, encode(entry, normalized)) then return true end
+            if (not permit or entry.CallbackRunning) and equal(entry.Record, encode(entry, normalized)) then return true end
             applying += 1
             local ok, err = pcall(function()
                 if entry.Kind == "Colorpicker" then entry.NativeSet(entry.Control, normalized.Color, normalized.Alpha)
@@ -3376,6 +3416,24 @@ function Callisto:Unload()
     if ConfigManager and not ConfigManager.Stopped then
         if ConfigManager.Ready then ConfigManager:Save() end
         ConfigManager:Stop()
+    end
+    for _, entry in ipairs(ConfigOrder) do
+        entry.PendingCallback = nil
+        local worker = entry.Worker
+        if worker and worker ~= coroutine.running() and coroutine.status(worker) ~= "dead" and task.cancel then
+            pcall(task.cancel, worker)
+        end
+        entry.Worker = nil
+        entry.CallbackRunning = false
+    end
+    table.clear(CallbackContexts)
+    local tweens = {}
+    for tween in pairs(ActiveTweens) do TIS(tweens, tween) end
+    for _, tween in ipairs(tweens) do
+        local connection = ActiveTweens[tween]
+        if connection then connection:Disconnect() end
+        pcall(function() tween:Cancel(); tween:Destroy() end)
+        ActiveTweens[tween] = nil
     end
 	if ThemeTransition then
 		ThemeTransition:Disconnect()
