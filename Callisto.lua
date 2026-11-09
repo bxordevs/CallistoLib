@@ -1,4 +1,26 @@
 --!strict
+--[[
+	Callisto — single-file UI library
+	Rebuilt from the original instance dump. Visuals are byte-for-byte the same
+	properties; everything else is structure, animation and theming.
+
+	Animation rules honoured throughout:
+	  - Controls retain their size; sections resize only when folded. Feedback is
+	    transparency, colour, position or rotation.
+	  - NO CanvasGroups anywhere: they flatten UIGradients over child text and
+	    have too many rendering caveats. Windows and popups fade through the
+	    Fader, which cascades transparency tweens over every descendant.
+	  - The slider fill DOES resize, instantly and untweened — that is the
+	    value display, not an animation.
+
+	local Callisto = loadstring(game:HttpGet("..."))()
+
+	local Window = Callisto:CreateWindow({ Title = "Callisto", Size = Vector2.new(591, 480) })
+	local Page   = Window:AddPage("General")
+	local Left   = Page:AddSection("Left", "Section #1")
+
+	Left:AddToggle({ Title = "Toggle", Default = false, Callback = print })
+]]
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -71,6 +93,7 @@ local ConfigOrder: { any } = {}
 local ConfigManager: any = nil
 local SectionEntries: { [string]: any } = {}
 local ActivePointers: { [Instance]: any } = {}
+local BooleanControls: { any } = {}
 local CallbackContexts: { [thread]: any } = {}
 local ActiveTweens: { [Tween]: RBXScriptConnection } = {}
 
@@ -804,173 +827,137 @@ end
 
 local SubElement = {}
 
--- Toggle: pill switch. Off = Toggle template, On = ToggleE template.
--- The knob slides (position) and everything else crossfades; nothing resizes.
-function SubElement.Toggle(parent: Instance, default: boolean, callback: (boolean) -> ())
-	local state = default and true or false
-
-	local button = Add("TextButton", {
-		Parent = parent,
-		Text = "",
-		AutoButtonColor = false,
-		Name = "Toggle",
-		Size = UFO(26, 16),
-		BorderSizePixel = 0,
-	})
-	Pill(button)
-	SurfaceGradient(button)
-	local outerStroke = Stroke(button, "Border", true)
-	local glow = Shadow(button, 0.65, "Accent")
-
-	-- accent fill, faded in when active
-	local fill = Add("Frame", {
-		Parent = button,
-		Name = "Gradient",
-		BackgroundTransparency = 1,
-		Size = UFS(1, 1),
-		BorderSizePixel = 0,
-		ZIndex = 2,
-	})
-	Pill(fill)
-	AccentGradient(fill)
-	local fillStroke = Stroke(fill, "AccentLight", true)
-	fillStroke.Transparency = 1
-
-	local knob = Add("Frame", {
-		Parent = button,
-		AnchorPoint = V2(0, 0.5),
-		Name = "Indicator",
-		BackgroundTransparency = 0.8,
-		Position = UD2(0, 2, 0.5, 0),
-		Size = UFO(12, 12),
-		ZIndex = 3,
-		BorderSizePixel = 0,
-		BackgroundColor3 = RGB(255, 255, 255),
-	})
-	Pill(knob)
-
-	local function render(animate: boolean?)
-		local info = animate == false and TI(0) or Anim.Base
-		Tween(fill, info, { BackgroundTransparency = state and 0 or 1 })
-		Tween(fillStroke, info, { Transparency = state and 0 or 1 })
-		Tween(outerStroke, info, { Transparency = state and 1 or 0 })
-		Tween(knob, state and Anim.Spring or Anim.Base, {
-			Position = state and UD2(1, -14, 0.5, 0) or UD2(0, 2, 0.5, 0),
-			BackgroundTransparency = state and 0 or 0.8,
-		})
-		if glow then
-			Tween(glow, info, { Transparency = state and 0.65 or 1 })
-		end
-	end
-
-	render(false)
-
-	Connect(button.Activated, function()
-		state = not state
-		render()
-		task.spawn(callback, state)
-	end)
-
-	-- hover feedback: knob brightens slightly (transparency only)
-	Hover(button, function(hovering)
-		if state then
-			return -- already fully opaque when on
-		end
-		Tween(knob, Anim.Fast, { BackgroundTransparency = hovering and 0.6 or 0.8 })
-	end)
-
-	return {
-		Instance = button,
-		Get = function()
-			return state
-		end,
-		Set = function(_, value: boolean)
-			state = value and true or false
-			render()
-			task.spawn(callback, state)
-		end,
-	}
+local function BuildBoolean(parent: Instance, default: boolean, callback, fallback: string)
+    local state = default and true or false
+    local style = Callisto.ToggleStyle or fallback
+    local button = Add("TextButton", {
+        Parent = parent, Text = "", AutoButtonColor = false, BorderSizePixel = 0,
+    })
+    local buttonCorner = Corner(button, 3)
+    SurfaceGradient(button)
+    local outerStroke = Stroke(button, "Border", true)
+    local glow = Shadow(button, 1, "Accent")
+    local fill = Add("Frame", { Parent = button, Name = "Gradient", Size = UFS(1, 1), BorderSizePixel = 0 })
+    local fillCorner = Corner(fill, 3)
+    AccentGradient(fill)
+    local fillStroke = Stroke(fill, "AccentLight", true)
+    local knob = Add("Frame", {
+        Parent = button, Name = "Indicator", AnchorPoint = V2(0, 0.5), Size = UFO(12, 12),
+        BorderSizePixel = 0, ZIndex = 3, BackgroundColor3 = RGB(255, 255, 255),
+    })
+    Pill(knob)
+    local icon = Add("ImageLabel", {
+        Parent = button, Name = "Icon", ScaleType = SCL.Fit, ResampleMode = RSM.Pixelated,
+        AnchorPoint = V2(0.5, 0.5), Image = "rbxassetid://114424333378875",
+        BackgroundTransparency = 1, Position = UFS(0.5, 0.5), Size = UFO(10, 10),
+        ZIndex = 2, BorderSizePixel = 0,
+    })
+    local function paint(object, info, goal)
+        Tween(object, info, goal)
+        if info.Time <= 0 then
+            for property, value in pairs(goal) do object[property] = value end
+        end
+    end
+    local function render(animate: boolean?)
+        local info = animate == false and TI(0) or Anim.Base
+        paint(fill, info, { BackgroundTransparency = state and 0 or 1 })
+        paint(fillStroke, info, { Transparency = state and 0 or 1 })
+        paint(outerStroke, info, { Transparency = state and 1 or 0 })
+        if style == "Toggle" then
+            paint(knob, animate == false and TI(0) or (state and Anim.Spring or Anim.Base), {
+                Position = state and UD2(1, -14, 0.5, 0) or UD2(0, 2, 0.5, 0),
+                BackgroundTransparency = state and 0 or 0.8,
+            })
+        else
+            paint(icon, info, { ImageTransparency = state and 0 or 1 })
+            paint(icon, animate == false and TI(0) or (state and Anim.Spring or Anim.Fast), { Rotation = state and 0 or -60 })
+        end
+        if glow then paint(glow, info, { Transparency = state and 0.65 or 1 }) end
+    end
+    local function refreshCache()
+        local rest = {
+            [button] = { BackgroundTransparency = 0, TextTransparency = 0 },
+            [fill] = { BackgroundTransparency = state and 0 or 1 },
+            [fillStroke] = { Transparency = state and 0 or 1 },
+            [outerStroke] = { Transparency = state and 1 or 0 },
+            [knob] = { BackgroundTransparency = state and 0 or 0.8 },
+            [icon] = { BackgroundTransparency = 1, ImageTransparency = state and 0 or 1 },
+        }
+        if glow then rest[glow] = { Transparency = state and 0.65 or 1 } end
+        local hidden = false
+        for root, cache in pairs(Fader.Cache) do
+            if button:IsDescendantOf(root) then
+                if Fader.State[root] == "hidden" then hidden = true end
+                for object, properties in pairs(rest) do
+                    cache[object] = cache[object] or {}
+                    for property, value in pairs(properties) do cache[object][property] = value end
+                end
+            end
+        end
+        for object, properties in pairs(rest) do
+            local goal = {}
+            for property, value in pairs(properties) do
+                local target = hidden and 1 or value
+                if object[property] ~= target then goal[property] = target end
+            end
+            if next(goal) then paint(object, TI(0), goal) end
+        end
+    end
+    local control: any = {
+        Instance = button,
+        Get = function() return state end,
+        Set = function(_, value: boolean)
+            state = value and true or false
+            render()
+            task.spawn(callback, state)
+        end,
+    }
+    function control:SetStyle(value: string)
+        assert(value == "Checkbox" or value == "Toggle", "Style must be Checkbox or Toggle")
+        if self.Style == value then return self end
+        local restyle = self.Style ~= nil
+        style, self.Style = value, value
+        local toggle = value == "Toggle"
+        button.Name = value
+        button.Size = UFO(toggle and 26 or 16, 16)
+        local radius = toggle and UD(1, 0) or UD(0, 3)
+        buttonCorner.CornerRadius, fillCorner.CornerRadius = radius, radius
+        fill.ZIndex = toggle and 2 or 1
+        knob.Visible, icon.Visible = toggle, not toggle
+        render(false)
+        if restyle then refreshCache() end
+        return self
+    end
+    control:SetStyle(style)
+    Connect(button.Activated, function()
+        state = not state
+        render()
+        task.spawn(callback, state)
+    end)
+    Hover(button, function(hovering)
+        if style ~= "Toggle" or state then return end
+        Tween(knob, Anim.Fast, { BackgroundTransparency = hovering and 0.6 or 0.8 })
+    end)
+    TIS(BooleanControls, control)
+    return control
 end
 
--- Checkbox: square with a tick. Off = Checkbox, On = CheckboxE.
--- The tick fades in while springing from a slight rotation — no size change.
-function SubElement.Checkbox(parent: Instance, default: boolean, callback: (boolean) -> ())
-	local state = default and true or false
+function SubElement.Toggle(parent: Instance, default: boolean, callback)
+    return BuildBoolean(parent, default, callback, "Toggle")
+end
 
-	local button = Add("TextButton", {
-		Parent = parent,
-		Text = "",
-		AutoButtonColor = false,
-		Name = "Checkbox",
-		Size = UFO(16, 16),
-		BorderSizePixel = 0,
-	})
-	Corner(button, 3)
-	SurfaceGradient(button)
-	local outerStroke = Stroke(button, "Border", true)
-	local glow = Shadow(button, 1, "Accent")
+function SubElement.Checkbox(parent: Instance, default: boolean, callback)
+    return BuildBoolean(parent, default, callback, "Checkbox")
+end
 
-	local fill = Add("Frame", {
-		Parent = button,
-		Name = "Gradient",
-		BackgroundTransparency = 1,
-		Size = UFS(1, 1),
-		BorderSizePixel = 0,
-	})
-	Corner(fill, 3)
-	AccentGradient(fill)
-	local fillStroke = Stroke(fill, "AccentLight", true)
-	fillStroke.Transparency = 1
-
-	local icon = Add("ImageLabel", {
-		Parent = button,
-		ScaleType = SCL.Fit,
-		Name = "Icon",
-		ResampleMode = RSM.Pixelated,
-		AnchorPoint = V2(0.5, 0.5),
-		Image = "rbxassetid://114424333378875",
-		BackgroundTransparency = 1,
-		ImageTransparency = 1,
-		Rotation = -60,
-		Position = UFS(0.5, 0.5),
-		Size = UFO(10, 10),
-		ZIndex = 2,
-		BorderSizePixel = 0,
-	})
-
-	local function render(animate: boolean?)
-		local info = animate == false and TI(0) or Anim.Base
-		Tween(fill, info, { BackgroundTransparency = state and 0 or 1 })
-		Tween(fillStroke, info, { Transparency = state and 0 or 1 })
-		Tween(outerStroke, info, { Transparency = state and 1 or 0 })
-		Tween(icon, info, { ImageTransparency = state and 0 or 1 })
-		Tween(icon, animate == false and TI(0) or (state and Anim.Spring or Anim.Fast), {
-			Rotation = state and 0 or -60,
-		})
-		if glow then
-			Tween(glow, info, { Transparency = state and 0.65 or 1 })
-		end
-	end
-
-	render(false)
-
-	Connect(button.Activated, function()
-		state = not state
-		render()
-		task.spawn(callback, state)
-	end)
-
-	return {
-		Instance = button,
-		Get = function()
-			return state
-		end,
-		Set = function(_, value: boolean)
-			state = value and true or false
-			render()
-			task.spawn(callback, state)
-		end,
-	}
+function Callisto:SetToggleStyle(style: string)
+    assert(style == "Checkbox" or style == "Toggle", "Style must be Checkbox or Toggle")
+    self.ToggleStyle = style
+    for index = #BooleanControls, 1, -1 do
+        local control = BooleanControls[index]
+        if not control.Instance.Parent then TR(BooleanControls, index)
+        elseif control.Style ~= style then control:SetStyle(style) end
+    end
 end
 
 --=============================================================================
@@ -3694,6 +3681,8 @@ function Callisto:Unload()
 	table.clear(ConfigEntries)
 	table.clear(ConfigOrder)
     table.clear(SectionEntries)
+    table.clear(BooleanControls)
+    self.ToggleStyle = nil
     ConfigManager = nil
     self.Config = nil
 	table.clear(LockedStates)
