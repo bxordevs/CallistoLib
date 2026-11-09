@@ -69,8 +69,19 @@ Callisto.Connections = {} :: { RBXScriptConnection }
 local ConfigEntries: { [string]: any } = {}
 local ConfigOrder: { any } = {}
 local ConfigManager: any = nil
+local SectionEntries: { [string]: any } = {}
+local ActivePointers: { [Instance]: any } = {}
 local CallbackContexts: { [thread]: any } = {}
 local ActiveTweens: { [Tween]: RBXScriptConnection } = {}
+
+local function ConfigKey(...): string
+    local parts = table.pack(...)
+    for index = 1, parts.n do
+        local value = tostring(parts[index])
+        parts[index] = #value .. ":" .. value
+    end
+    return table.concat(parts, "/", 1, parts.n)
+end
 
 local function SetFlag(flag: string, value: any)
     local previous = Callisto.Flags[flag]
@@ -321,6 +332,7 @@ local function BindPointerDrag(handle: GuiObject, beginDrag, moveDrag, endDrag, 
         if input and input ~= active and not (active.UserInputType == UIT.MouseButton1
             and input.UserInputType == UIT.MouseButton1) then return end
         active = nil
+        ActivePointers[handle] = nil
         Disconnect(ending)
         ending = nil
         if scroller then
@@ -340,6 +352,7 @@ local function BindPointerDrag(handle: GuiObject, beginDrag, moveDrag, endDrag, 
         if active or (input.UserInputType ~= UIT.MouseButton1 and input.UserInputType ~= UIT.Touch) then return end
         if not handle.Interactable or beginDrag(input) == false then return end
         active = input
+        ActivePointers[handle] = finish
         if captureScroll and input.UserInputType == UIT.Touch then
             scroller = handle:FindFirstAncestorWhichIsA("ScrollingFrame")
             if scroller then
@@ -1602,6 +1615,7 @@ function Section:AddColorpicker(options: { [string]: any })
 	)
 
 	picker.Row = row
+    TIS(self._ClosePopups, picker.Close)
 	return picker
 end
 
@@ -2408,6 +2422,7 @@ function Section:AddDropdown(options: { [string]: any })
 		end
 	end)
 
+    TIS(self._ClosePopups, function() setOpen(false) end)
 	render()
 
 	return {
@@ -2587,74 +2602,137 @@ Page.__index = Page
 	Page:AddSection("Left", "Section #1")
 	Page:AddSection("Section #1")          -- side omitted, defaults to Left
 ]]
-function Page:AddSection(side: string, title: string?)
-	local normalized = side and side:lower() or "left"
-
-	-- Allow the side argument to be skipped entirely.
-	if normalized ~= "left" and normalized ~= "right" then
-		title = side
-		normalized = "left"
-	end
-
-	local parent = (normalized == "right") and self.Right or self.Left
-
-	local section = Add("Frame", {
-		Parent = parent,
-		Size = UFS(1, 0),
-		Name = "Section",
-		AutomaticSize = AT.Y,
-		BorderSizePixel = 0,
-	})
-	Bind(section, { BackgroundColor3 = "Background" })
-	Stroke(section, "Border", true)
-	Corner(section, 5)
-	Shadow(section, 0.6)
-
-	local header = Add("Frame", {
-		Parent = section,
-		Name = "Header",
-		Size = UD2(1, 0, 0, 25),
-		BorderSizePixel = 0,
-	})
-	Bind(header, { BackgroundColor3 = "Foreground" })
-	Add("UICorner", {
-		Parent = header,
-		TopLeftRadius = UD(0, 5),
-		TopRightRadius = UD(0, 5),
-		BottomRightRadius = UD(0, 0),
-		BottomLeftRadius = UD(0, 0),
-	})
-	Stroke(header, "Border", true)
-
-	Text(header, {
-		Name = "Title",
-		Text = title or "Section",
-		Size = UFS(0, 1),
-		Position = UFO(5, 0),
-		TextTruncate = ETT.SplitWord,
-		AutomaticSize = AT.X,
-	})
-
-	local content = Add("Frame", {
-		Parent = section,
-		ClipsDescendants = true,
-		Name = "Content",
-		BackgroundTransparency = 1,
-		Position = UFO(0, 25),
-		Size = UFS(1, 0),
-		AutomaticSize = AT.Y,
-		BorderSizePixel = 0,
-	})
-	Padding(content, 10, 11, 11, 11)
-	List(content, { Padding = UD(0, 7) })
-
-	return setmetatable({
-		Instance = section,
-		Content = content,
-		Window = self.Window,
-		Page = self,
-		_order = 0,
-	}, Section)
+function Page:AddSection(side: string, title: string?, options: { [string]: any }?)
+    local opts = options or {}
+    local normalized = side and side:lower() or "left"
+    if normalized ~= "left" and normalized ~= "right" then
+        title = side
+        normalized = "left"
+    end
+    title = title or "Section"
+    local parent = normalized == "right" and self.Right or self.Left
+    local collapsible = opts.Collapsible ~= false
+    local collapsed = collapsible and opts.Collapsed == true
+    local section = Add("Frame", {
+        Parent = parent, Name = "Section", Size = UD2(1, 0, 0, collapsed and 25 or 46),
+        AutomaticSize = AT.None, BorderSizePixel = 0,
+    })
+    Bind(section, { BackgroundColor3 = "Background" })
+    Stroke(section, "Border", true)
+    Corner(section, 5)
+    Shadow(section, 0.6)
+    local header = Add("Frame", {
+        Parent = section, Name = "Header", Size = UD2(1, 0, 0, 25), BorderSizePixel = 0,
+    })
+    Bind(header, { BackgroundColor3 = "Foreground" })
+    local headerCorner = Add("UICorner", {
+        Parent = header, TopLeftRadius = UD(0, 5), TopRightRadius = UD(0, 5),
+        BottomRightRadius = UD(0, collapsed and 5 or 0), BottomLeftRadius = UD(0, collapsed and 5 or 0),
+    })
+    Stroke(header, "Border", true)
+    local button = Add("TextButton", {
+        Parent = header, Name = "Collapse", Text = "", BackgroundTransparency = 1,
+        AutoButtonColor = false, BorderSizePixel = 0, Size = UFS(1, 1),
+        Active = collapsible, Interactable = collapsible,
+    })
+    Text(header, {
+        Name = "Title", Text = title, Position = UFO(5, 0),
+        Size = collapsible and UD2(1, -30, 1, 0) or UFS(0, 1),
+        TextXAlignment = collapsible and TXA.Left or nil,
+        TextTruncate = ETT.SplitWord, AutomaticSize = collapsible and AT.None or AT.X,
+    })
+    local arrow = Add("ImageLabel", {
+        Parent = header, Name = "Icon", ScaleType = SCL.Fit, ResampleMode = RSM.Pixelated,
+        AnchorPoint = V2(1, 0.5), Position = UD2(1, -8, 0.5, 0), Size = UFO(10, 10),
+        Image = "rbxassetid://77930667227229", BackgroundTransparency = 1,
+        BorderSizePixel = 0, Rotation = collapsed and 0 or 180, Visible = collapsible,
+    })
+    local body = Add("Frame", {
+        Parent = section, Name = "Body", BackgroundTransparency = 1, BorderSizePixel = 0,
+        Position = UFO(0, 25), Size = UD2(1, 0, 1, -25), ClipsDescendants = true,
+    })
+    local content = Add("Frame", {
+        Parent = body, Name = "Content", BackgroundTransparency = 1, BorderSizePixel = 0,
+        Size = UFS(1, 0), AutomaticSize = AT.Y, ClipsDescendants = true,
+    })
+    Padding(content, 10, 11, 11, 11)
+    local layout = List(content, { Padding = UD(0, 7) })
+    local reveal = Add("NumberValue", { Parent = section, Name = "Reveal", Value = collapsed and 0 or 1 })
+    local result: any = setmetatable({
+        Instance = section, Header = header, Content = content, Body = body,
+        Arrow = arrow, CollapseButton = button, Window = self.Window, Page = self,
+        Collapsed = collapsed, Collapsible = collapsible, _ClosePopups = {}, _order = 0,
+    }, Section)
+    local transitions = {}
+    local queued, destroyed = false, false
+    local function render()
+        if destroyed or not section.Parent then return end
+        local natural = math.max(21, content.AbsoluteSize.Y / GuiScale(content))
+        local height = 25 + natural * reveal.Value
+        if section.Size.Y.Offset ~= height then section.Size = UD2(1, 0, 0, height) end
+    end
+    local function queueRender()
+        if queued or destroyed then return end
+        queued = true
+        task.defer(function()
+            queued = false
+            render()
+        end)
+    end
+    local function stopTransitions()
+        for _, tween in ipairs(transitions) do pcall(function() tween:Cancel() end) end
+        table.clear(transitions)
+    end
+    function result:SetCollapsed(state: boolean, animate: boolean?)
+        assert(type(state) == "boolean", "Collapsed must be a boolean")
+        if destroyed or not collapsible then return self end
+        local changed = collapsed ~= state
+        if not changed and animate ~= false then return self end
+        collapsed, self.Collapsed = state, state
+        if state then
+            for _, close in ipairs(self._ClosePopups) do close() end
+            for handle, finish in pairs(ActivePointers) do
+                if handle:IsDescendantOf(content) then finish() end
+            end
+            local ok, focused = pcall(function() return UserInputService:GetFocusedTextBox() end)
+            if ok and focused and focused:IsDescendantOf(content) then focused:ReleaseFocus() end
+        end
+        stopTransitions()
+        local target = state and 0 or 1
+        local radius = UD(0, state and 5 or 0)
+        if animate == false then
+            reveal.Value = target
+            arrow.Rotation = state and 0 or 180
+            headerCorner.BottomLeftRadius, headerCorner.BottomRightRadius = radius, radius
+            render()
+        else
+            TIS(transitions, Tween(reveal, Anim.Slow, { Value = target }))
+            TIS(transitions, Tween(arrow, Anim.Slow, { Rotation = state and 0 or 180 }))
+            TIS(transitions, Tween(headerCorner, Anim.Slow, { BottomLeftRadius = radius, BottomRightRadius = radius }))
+        end
+        if changed and self.ConfigId and ConfigManager and not ConfigManager.Stopped then ConfigManager:_Changed() end
+        return self
+    end
+    function result:IsCollapsed() return collapsed end
+    function result:ToggleCollapsed() return self:SetCollapsed(not collapsed) end
+    Connect(button.Activated, function() result:ToggleCollapsed() end)
+    Connect(reveal:GetPropertyChangedSignal("Value"), render)
+    Connect(content:GetPropertyChangedSignal("AbsoluteSize"), queueRender)
+    Connect(layout:GetPropertyChangedSignal("AbsoluteContentSize"), queueRender)
+    Connect(section.Destroying, function()
+        destroyed = true
+        stopTransitions()
+        if result.ConfigId and SectionEntries[result.ConfigId] == result then SectionEntries[result.ConfigId] = nil end
+    end)
+    if collapsible and opts.Config ~= false then
+        self._SectionCounts = self._SectionCounts or {}
+        local identity = opts.ConfigId or ConfigKey(normalized, title)
+        self._SectionCounts[identity] = (self._SectionCounts[identity] or 0) + 1
+        result.ConfigId = ConfigKey(self._ConfigId, identity, self._SectionCounts[identity])
+        SectionEntries[result.ConfigId] = result
+    end
+    render()
+    return result
 end
 
 --=============================================================================
@@ -2750,8 +2828,11 @@ function Window:AddPage(name: string)
 		TextSize = 15,
 	})
 
+    local occurrence = 1
+    for _, existing in ipairs(self.PageList) do if existing.Name == name then occurrence += 1 end end
 	local page: any = setmetatable({
 		Name = name,
+        _ConfigId = ConfigKey(self._ConfigId, name, occurrence),
 		Instance = frame,
 		Left = left,
 		Right = right,
@@ -3033,8 +3114,12 @@ function Callisto:CreateWindow(options: { [string]: any }?)
 		BorderSizePixel = 0,
 	})
 
+    local identity = opts.ConfigId or opts.Title or "Callisto"
+    local occurrence = 1
+    for _, existing in ipairs(self.Windows) do if existing._Identity == identity then occurrence += 1 end end
 	local window: any = setmetatable({
 		Root = root,
+        _Identity = identity, _ConfigId = ConfigKey(identity, occurrence),
 		ScreenGui = screenGui,
 		Canvas = canvas,
 		Header = header,
@@ -3455,9 +3540,12 @@ do
             cancelPending()
             self:RefreshAccess()
             cancelPending()
-            local profile, premium = { Values = {} }, self:_Premium()
+            local profile, premium = { Values = {}, Sections = {} }, self:_Premium()
             for _, entry in ipairs(order) do
                 if not entry.VIP or premium then profile.Values[entry.Flag] = entry.Record end
+            end
+            for key, section in pairs(SectionEntries) do
+                if section.Instance.Parent then profile.Sections[key] = section:IsCollapsed() end
             end
             if lastSaved and equal(profile, lastSaved) then self.Dirty = false; self.Ready = true; return true end
             local ok, err = pcall(function()
@@ -3524,6 +3612,13 @@ do
                     end
                 end
             end
+            if profile and type(profile.Sections) == "table" then
+                for key, section in pairs(SectionEntries) do
+                    local state = profile.Sections[key]
+                    if type(state) == "boolean" then section:SetCollapsed(state, false)
+                    elseif state ~= nil then TIS(skipped, "Section " .. key) end
+                end
+            end
             lastSaved = profile
             self.Ready, self.Dirty = true, true
             loading = false
@@ -3551,6 +3646,8 @@ function Callisto:Unload()
         if ConfigManager.Ready then ConfigManager:Save() end
         ConfigManager:Stop()
     end
+    for _, finish in pairs(ActivePointers) do finish() end
+    table.clear(ActivePointers)
     for _, entry in ipairs(ConfigOrder) do
         entry.PendingCallback = nil
         local worker = entry.Worker
@@ -3596,6 +3693,7 @@ function Callisto:Unload()
 	table.clear(self.Flags)
 	table.clear(ConfigEntries)
 	table.clear(ConfigOrder)
+    table.clear(SectionEntries)
     ConfigManager = nil
     self.Config = nil
 	table.clear(LockedStates)
