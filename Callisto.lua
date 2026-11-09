@@ -295,6 +295,81 @@ local function Connect(signal: RBXScriptSignal, callback)
 	return connection
 end
 
+local function Disconnect(connection)
+    if not connection then return end
+    connection:Disconnect()
+    local index = TF(Callisto.Connections, connection)
+    if index then TR(Callisto.Connections, index) end
+end
+
+local function GuiScale(object: Instance?): number
+    local scale = 1
+    while object and not object:IsA("ScreenGui") do
+        local modifier = object:FindFirstChildOfClass("UIScale")
+        if modifier then scale *= modifier.Scale end
+        object = object.Parent
+    end
+    return math.max(scale, 0.001)
+end
+
+local DragScrollers: { [Instance]: any } = {}
+
+local function BindPointerDrag(handle: GuiObject, beginDrag, moveDrag, endDrag, captureScroll: boolean?)
+    local active, ending, scroller
+    local function finish(input)
+        if not active then return end
+        if input and input ~= active and not (active.UserInputType == UIT.MouseButton1
+            and input.UserInputType == UIT.MouseButton1) then return end
+        active = nil
+        Disconnect(ending)
+        ending = nil
+        if scroller then
+            local saved = DragScrollers[scroller]
+            if saved then
+                saved.Count -= 1
+                if saved.Count == 0 then
+                    if scroller.Parent then scroller.ScrollingEnabled = saved.Enabled end
+                    DragScrollers[scroller] = nil
+                end
+            end
+        end
+        scroller = nil
+        if endDrag then endDrag() end
+    end
+    Connect(handle.InputBegan, function(input)
+        if active or (input.UserInputType ~= UIT.MouseButton1 and input.UserInputType ~= UIT.Touch) then return end
+        if not handle.Interactable or beginDrag(input) == false then return end
+        active = input
+        if captureScroll and input.UserInputType == UIT.Touch then
+            scroller = handle:FindFirstAncestorWhichIsA("ScrollingFrame")
+            if scroller then
+                local saved = DragScrollers[scroller]
+                if not saved then
+                    saved = { Count = 0, Enabled = scroller.ScrollingEnabled }
+                    DragScrollers[scroller] = saved
+                end
+                saved.Count += 1
+                scroller.ScrollingEnabled = false
+            end
+        end
+        ending = Connect(input.Changed, function()
+            if input.UserInputState == Enum.UserInputState.End or input.UserInputState == Enum.UserInputState.Cancel then
+                finish(input)
+            end
+        end)
+    end)
+    Connect(UserInputService.InputChanged, function(input)
+        if not active then return end
+        if active.UserInputType == UIT.Touch then
+            if input ~= active then return end
+        elseif input.UserInputType ~= UIT.MouseMovement then return end
+        moveDrag(input)
+    end)
+    Connect(UserInputService.InputEnded, finish)
+    Connect(handle.Destroying, function() finish() end)
+    return finish
+end
+
 local function SetBorderActive(stroke: UIStroke, active: boolean)
     local state = BorderStates[stroke]
     if not state then
@@ -489,18 +564,14 @@ end
 -- Draggable: smooth, frame-rate independent follow. The lerp loop only runs
 -- while dragging (and briefly afterwards, to settle), so it never fights the
 -- position tweens the open/close animations play on the same target.
-local function MakeDraggable(handle: GuiObject, target: GuiObject)
+local function MakeDraggable(handle: GuiObject, target: GuiObject, constrain)
     local dragging, dragStart, startPosition = false, Vector3.zero, UD2()
     local goal = target.Position
-    local frameConnection, inputConnection
-    local function disconnect(connection)
-        if not connection then return end
-        connection:Disconnect()
-        local index = TF(Callisto.Connections, connection)
-        if index then TR(Callisto.Connections, index) end
-    end
+    local frameConnection
+    local touch = false
     local function step(dt)
-        if not target.Parent then disconnect(frameConnection); frameConnection = nil; return end
+        if not target.Parent then Disconnect(frameConnection); frameConnection = nil; return end
+        if constrain then goal = constrain(goal, touch) end
         local position = target.Position
         local settled = not dragging
             and math.abs(goal.X.Offset - position.X.Offset) < 0.5
@@ -509,74 +580,44 @@ local function MakeDraggable(handle: GuiObject, target: GuiObject)
             and math.abs(goal.Y.Scale - position.Y.Scale) < 0.001
         if settled then
             target.Position = goal
-            disconnect(frameConnection)
+            Disconnect(frameConnection)
             frameConnection = nil
             return
         end
         target.Position = position:Lerp(goal, MC(dt * 20, 0, 1))
     end
-    Connect(handle.InputBegan, function(input)
-        if input.UserInputType == UIT.MouseButton1 or input.UserInputType == UIT.Touch then
-            dragging = true
-            dragStart = input.Position
-            startPosition = target.Position
-            goal = startPosition
-            disconnect(inputConnection)
-            inputConnection = Connect(input.Changed, function()
-                if input.UserInputState == Enum.UserInputState.End then
-                    dragging = false
-                    disconnect(inputConnection)
-                    inputConnection = nil
-                end
-            end)
-            if not frameConnection then frameConnection = Connect(RunService.RenderStepped, step) end
-        end
-    end)
-    Connect(UserInputService.InputChanged, function(input)
-        if not dragging then return end
-        if input.UserInputType ~= UIT.MouseMovement and input.UserInputType ~= UIT.Touch then return end
+    BindPointerDrag(handle, function(input)
+        dragging = true
+        touch = input.UserInputType == UIT.Touch
+        dragStart = input.Position
+        startPosition = target.Position
+        goal = startPosition
+        if not frameConnection then frameConnection = Connect(RunService.RenderStepped, step) end
+    end, function(input)
         local delta = input.Position - dragStart
-        goal = UD2(startPosition.X.Scale, startPosition.X.Offset + delta.X,
-            startPosition.Y.Scale, startPosition.Y.Offset + delta.Y)
-    end)
+        local scale = GuiScale(target.Parent)
+        goal = UD2(startPosition.X.Scale, startPosition.X.Offset + delta.X / scale,
+            startPosition.Y.Scale, startPosition.Y.Offset + delta.Y / scale)
+        if constrain then goal = constrain(goal, touch) end
+    end, function() dragging = false end)
 end
 
 -- User-driven resizing. This changes Size, but it is direct manipulation of
 -- the window by the user — not an animation — so it does not break the rule.
 local function MakeResizable(handle: GuiButton, target: GuiObject, minimum: Vector2)
-	local resizing, startPosition, startSize = false, Vector3.zero, V2()
-
-	Connect(handle.InputBegan, function(input)
-		if input.UserInputType == UIT.MouseButton1 or input.UserInputType == UIT.Touch then
-			resizing = true
-			startPosition = input.Position
-			startSize = target.AbsoluteSize
-
-			local connection
-			connection = Connect(input.Changed, function()
-				if input.UserInputState == Enum.UserInputState.End then
-					resizing = false
-                    connection:Disconnect()
-                    local index = TF(Callisto.Connections, connection)
-                    if index then TR(Callisto.Connections, index) end
-				end
-			end)
-		end
-	end)
-
-	Connect(UserInputService.InputChanged, function(input)
-		if not resizing then
-			return
-		end
-		if input.UserInputType ~= UIT.MouseMovement and input.UserInputType ~= UIT.Touch then
-			return
-		end
-		local delta = input.Position - startPosition
-		target.Size = UFO(
-			math.max(minimum.X, MR(startSize.X + delta.X)),
-			math.max(minimum.Y, MR(startSize.Y + delta.Y))
-		)
-	end)
+    local startPosition, startSize = Vector3.zero, V2()
+    local startScale = 1
+    BindPointerDrag(handle, function(input)
+        startPosition = input.Position
+        startScale = GuiScale(target)
+        startSize = V2(target.AbsoluteSize.X / startScale, target.AbsoluteSize.Y / startScale)
+    end, function(input)
+        local delta = input.Position - startPosition
+        target.Size = UFO(
+            math.max(minimum.X, MR(startSize.X + delta.X / startScale)),
+            math.max(minimum.Y, MR(startSize.Y + delta.Y / startScale))
+        )
+    end)
 end
 
 --=============================================================================
@@ -703,7 +744,18 @@ end
 -- makes the maths inset-proof.
 local function ToHolderSpace(holder: Instance, x: number, y: number): UDim2
 	local origin: Vector2 = (holder :: any).AbsolutePosition
-	return UFO(MR(x - origin.X), MR(y - origin.Y))
+	local scale = GuiScale(holder)
+	return UFO(MR((x - origin.X) / scale), MR((y - origin.Y) / scale))
+end
+
+local function PopupPosition(holder: GuiObject, popup: GuiObject, x: number, y: number, above: number): UDim2
+    local scale = GuiScale(holder)
+    local origin, bounds = holder.AbsolutePosition, holder.AbsoluteSize
+    local width, height = popup.Size.X.Offset * scale, popup.Size.Y.Offset * scale
+    if y + height > origin.Y + bounds.Y - 8 and above - height >= origin.Y + 8 then y = above - height end
+    x = MC(x, origin.X + 8, math.max(origin.X + 8, origin.X + bounds.X - width - 8))
+    y = MC(y, origin.Y + 8, math.max(origin.Y + 8, origin.Y + bounds.Y - height - 8))
+    return ToHolderSpace(holder, x, y)
 end
 
 -- Shared open/close animation for popups: Fader cascade + an 8px vertical
@@ -800,7 +852,7 @@ function SubElement.Toggle(parent: Instance, default: boolean, callback: (boolea
 
 	render(false)
 
-	Connect(button.MouseButton1Click, function()
+	Connect(button.Activated, function()
 		state = not state
 		render()
 		task.spawn(callback, state)
@@ -889,7 +941,7 @@ function SubElement.Checkbox(parent: Instance, default: boolean, callback: (bool
 
 	render(false)
 
-	Connect(button.MouseButton1Click, function()
+	Connect(button.Activated, function()
 		state = not state
 		render()
 		task.spawn(callback, state)
@@ -1121,38 +1173,18 @@ local function BuildColorpicker(holder: Instance, swatch: GuiButton, default: Co
 	end
 
 	-- Generic click-and-drag binding for the three tracks.
-	local function BindTrack(track: GuiObject, apply: (Vector2) -> ())
-		local dragging = false
-
-		local function update(position: Vector3 | Vector2)
-			local absolutePosition = track.AbsolutePosition
-			local absoluteSize = track.AbsoluteSize
-			apply(V2(
-				MC((position.X - absolutePosition.X) / absoluteSize.X, 0, 1),
-				MC((position.Y - absolutePosition.Y) / absoluteSize.Y, 0, 1)
-			))
-		end
-
-		Connect(track.InputBegan, function(input)
-			if input.UserInputType == UIT.MouseButton1 or input.UserInputType == UIT.Touch then
-				dragging = true
-				update(input.Position)
-			end
-		end)
-		Connect(UserInputService.InputEnded, function(input)
-			if input.UserInputType == UIT.MouseButton1 or input.UserInputType == UIT.Touch then
-				dragging = false
-			end
-		end)
-		Connect(UserInputService.InputChanged, function(input)
-			if not dragging then
-				return
-			end
-			if input.UserInputType == UIT.MouseMovement or input.UserInputType == UIT.Touch then
-				update(input.Position)
-			end
-		end)
-	end
+    local function BindTrack(track: GuiObject, apply: (Vector2) -> ())
+        local function update(input)
+            local position = input.Position
+            local absolutePosition, absoluteSize = track.AbsolutePosition, track.AbsoluteSize
+            if absoluteSize.X <= 0 or absoluteSize.Y <= 0 then return end
+            apply(V2(
+                MC((position.X - absolutePosition.X) / absoluteSize.X, 0, 1),
+                MC((position.Y - absolutePosition.Y) / absoluteSize.Y, 0, 1)
+            ))
+        end
+        BindPointerDrag(track, update, update, nil, true)
+    end
 
 	BindTrack(hueBar, function(position)
         if hue == position.X then return end
@@ -1179,11 +1211,15 @@ local function BuildColorpicker(holder: Instance, swatch: GuiButton, default: Co
 		open = shouldOpen
 
 		local absolutePosition = swatch.AbsolutePosition
-		local base = ToHolderSpace(holder, absolutePosition.X - 187, absolutePosition.Y + 22)
+		local scale = GuiScale(holder)
+        local base = PopupPosition(holder, panel, absolutePosition.X - 187 * scale,
+            absolutePosition.Y + 22 * scale, absolutePosition.Y - 4 * scale)
 		AnimatePopup(panel, open, base)
 	end
 
-	Connect(swatch.MouseButton1Click, function()
+    Connect(holder:GetPropertyChangedSignal("Size"), function() setOpen(false) end)
+
+	Connect(swatch.Activated, function()
 		setOpen(not open)
 	end)
 
@@ -1449,7 +1485,7 @@ function Section:AddButton(options: { [string]: any })
 		end)
 		Press(button)
 
-		Connect(button.MouseButton1Click, function()
+		Connect(button.Activated, function()
 			flash.BackgroundTransparency = 0.25
 			flashStroke.Transparency = 0.25
 			Tween(flash, Anim.Slow, { BackgroundTransparency = 1 })
@@ -1686,7 +1722,7 @@ function Section:AddKeybind(options: { [string]: any })
         if options.Flag then SetFlag(options.Flag, current) end
     end
 
-    Connect(button.MouseButton1Click, function()
+    Connect(button.Activated, function()
         if isLocked() then return end
         binding = true
         render()
@@ -1853,7 +1889,7 @@ function Section:AddSlider(options: { [string]: any })
         if commit and not isLocked() and IsFiniteNumber(parsed) then set(parsed) else render() end
     end
     local lastClick = -math.huge
-    Connect(current.MouseButton1Click, function()
+    Connect(current.Activated, function()
         if isLocked() then return end
         local now = os.clock()
         if now - lastClick <= 0.3 then
@@ -1897,22 +1933,18 @@ function Section:AddSlider(options: { [string]: any })
         local progress = MC((position.X - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
         set(minimum + (maximum - minimum) * progress)
     end
-    Connect(track.InputBegan, function(input)
-        if isLocked() then return end
-        if input.UserInputType == UIT.MouseButton1 or input.UserInputType == UIT.Touch then
-            finishEditing(true)
-            dragging = true
-            updateFromInput(input.Position)
-        end
+    local stopDragging = BindPointerDrag(track, function(input)
+        if isLocked() then return false end
+        finishEditing(true)
+        dragging = true
+        updateFromInput(input.Position)
+    end, function(input)
+        if not isLocked() then updateFromInput(input.Position) end
+    end, function() dragging = false end, true)
+    Connect(container:GetPropertyChangedSignal("Interactable"), function()
+        if isLocked() then stopDragging() end
     end)
-    Connect(UserInputService.InputEnded, function(input)
-        if input.UserInputType == UIT.MouseButton1 or input.UserInputType == UIT.Touch then dragging = false end
-    end)
-    Connect(UserInputService.InputChanged, function(input)
-        if dragging and (input.UserInputType == UIT.MouseMovement or input.UserInputType == UIT.Touch) then
-            updateFromInput(input.Position)
-        end
-    end)
+
     Hover(track, function(over) SetBorderActive(trackStroke, over) end)
     set(value, true)
     return {
@@ -2194,13 +2226,17 @@ function Section:AddDropdown(options: { [string]: any })
 		local count = #entries
 		local contentHeight = count * ENTRY_HEIGHT + math.max(count - 1, 0) * ENTRY_GAP
 		local height = math.min(contentHeight + 11, options.MaxHeight or 160)
-		popup.Size = UFO(MR(button.AbsoluteSize.X), height)
+		popup.Size = UFO(MR(button.AbsoluteSize.X / GuiScale(externals)), height)
 
 		local absolutePosition = button.AbsolutePosition
-		local base = ToHolderSpace(externals, absolutePosition.X, absolutePosition.Y + 28)
+		local scale = GuiScale(externals)
+        local base = PopupPosition(externals, popup, absolutePosition.X, absolutePosition.Y + 28 * scale,
+            absolutePosition.Y - 4 * scale)
 		AnimatePopup(popup, open, base)
 		Tween(icon, Anim.Slow, { Rotation = open and 180 or 0 })
 	end
+
+    Connect(externals:GetPropertyChangedSignal("Size"), function() setOpen(false) end)
 
 	local function AddOption(value: string)
 		-- fixed height + full width instead of AutomaticSize: automatic sizing
@@ -2222,7 +2258,7 @@ function Section:AddDropdown(options: { [string]: any })
             local connection = Connect(event, callback)
             TIS(connections, connection)
         end
-        connectEntry(entry.MouseButton1Click, function()
+        connectEntry(entry.Activated, function()
             if not container.Interactable or not button.Interactable or not entry.Interactable then return end
 			local index = TF(selected, value)
 			if multi then
@@ -2342,7 +2378,7 @@ function Section:AddDropdown(options: { [string]: any })
         if open then
             local height = math.min(#entries * ENTRY_HEIGHT + math.max(#entries - 1, 0) * ENTRY_GAP + 11,
                 options.MaxHeight or 160)
-            popup.Size = UFO(MR(button.AbsoluteSize.X), height)
+            popup.Size = UFO(MR(button.AbsoluteSize.X / GuiScale(externals)), height)
         end
         return true
     end
@@ -2351,7 +2387,7 @@ function Section:AddDropdown(options: { [string]: any })
 	-- prime the fader with the fully-built option list (see colorpicker note)
 	Fader.Out(popup, TI(0))
 
-	Connect(button.MouseButton1Click, function()
+	Connect(button.Activated, function()
 		setOpen(not open)
 	end)
 
@@ -2505,7 +2541,7 @@ function Section:AddSwitch(options: { [string]: any })
 		})
 
 		if not disabled then
-			Connect(button.MouseButton1Click, function()
+			Connect(button.Activated, function()
 				if index == position then
 					return
 				end
@@ -2735,7 +2771,7 @@ function Window:AddPage(name: string)
 
 	page.SetActive = setActive
 
-	Connect(button.MouseButton1Click, function()
+	Connect(button.Activated, function()
 		self:SelectPage(page)
 	end)
 
@@ -2800,6 +2836,10 @@ function Window:Toggle(state: boolean?)
 		return
 	end
 	self.Visible = open
+    if self.MobileStroke then
+        self.MobileStroke.Color = Callisto.Theme[open and "Accent" or "Border"]
+        Bind(self.MobileStroke, { Color = open and "Accent" or "Border" })
+    end
 
 	local canvas: any = self.Canvas
 
@@ -3009,8 +3049,102 @@ function Callisto:CreateWindow(options: { [string]: any }?)
 		HomePosition = nil,
 	}, Window)
 
-	MakeDraggable(header, canvas)
-	MakeResizable(resize, canvas, opts.MinSize or V2(420, 320))
+    local canvasScale = Add("UIScale", { Parent = canvas, Name = "FitScale", Scale = 1 })
+    local popupScale = Add("UIScale", { Parent = externals, Name = "FitScale", Scale = 1 })
+    local mobileGui = Add("ScreenGui", {
+        Parent = root, Name = "MobileToggle", Enabled = false, ResetOnSpawn = false,
+        IgnoreGuiInset = false, ZIndexBehavior = ZIB.Sibling, DisplayOrder = 1000,
+    })
+    local mobileButton = Add("TextButton", {
+        Parent = mobileGui, Name = "Toggle", Text = "", AutoButtonColor = false,
+        Position = UFO(12, 12), Size = UFO(44, 44), BorderSizePixel = 0, Active = true,
+    })
+    Corner(mobileButton, 5)
+    SurfaceGradient(mobileButton)
+    local mobileStroke = Stroke(mobileButton, "Accent", true)
+    for index = 1, 3 do
+        local bar = Add("Frame", {
+            Parent = mobileButton, Name = "Bar" .. index, BorderSizePixel = 0,
+            Position = UFO(12, 14 + (index - 1) * 7), Size = UFO(20, 2),
+        })
+        Bind(bar, { BackgroundColor3 = "Text" })
+        Corner(bar, 1)
+    end
+    window.Scale = canvasScale
+    window.MobileButton = mobileButton
+    window.MobileGui = mobileGui
+    window.MobileStroke = mobileStroke
+    local touchResize = Add("TextButton", {
+        Parent = canvas, Name = "TouchResize", Text = "", AutoButtonColor = false,
+        BackgroundTransparency = 1, BorderSizePixel = 0, Visible = false,
+        AnchorPoint = V2(1, 1), Position = UFS(1, 1), Size = UFO(44, 44), ZIndex = 5,
+    })
+    local function viewport()
+        local bounds = screenGui.AbsoluteSize
+        if bounds.X <= 0 or bounds.Y <= 0 then
+            local camera = workspace.CurrentCamera
+            bounds = camera and camera.ViewportSize or V2(1280, 720)
+        end
+        return bounds
+    end
+    local function boundWindow(position, touch)
+        if not touch and not UserInputService.TouchEnabled and canvasScale.Scale == 1 then return position end
+        local bounds = viewport()
+        local width = canvas.Size.X.Offset * canvasScale.Scale
+        local height = canvas.Size.Y.Offset * canvasScale.Scale
+        local x = position.X.Scale * bounds.X + position.X.Offset
+        local y = position.Y.Scale * bounds.Y + position.Y.Offset
+        x = MC(x, 12 + width * 0.5, math.max(12 + width * 0.5, bounds.X - 12 - width * 0.5))
+        y = MC(y, 12 + height * 0.5, math.max(12 + height * 0.5, bounds.Y - 12 - height * 0.5))
+        return UD2(position.X.Scale, x - position.X.Scale * bounds.X,
+            position.Y.Scale, y - position.Y.Scale * bounds.Y)
+    end
+    local function boundButton(position)
+        local bounds = mobileGui.AbsoluteSize
+        if bounds.X <= 0 or bounds.Y <= 0 then bounds = viewport() end
+        local x = position.X.Scale * bounds.X + position.X.Offset
+        local y = position.Y.Scale * bounds.Y + position.Y.Offset
+        return UFO(MC(x, 8, math.max(8, bounds.X - 52)), MC(y, 8, math.max(8, bounds.Y - 52)))
+    end
+    local function updateFit()
+        if not root.Parent then return end
+        screenGui.IgnoreGuiInset = not UserInputService.TouchEnabled
+        local bounds = viewport()
+        local scale = math.min(1, math.max(1, bounds.X - 24) / math.max(1, canvas.Size.X.Offset),
+            math.max(1, bounds.Y - 24) / math.max(1, canvas.Size.Y.Offset))
+        canvasScale.Scale, popupScale.Scale = scale, scale
+        externals.Size = UFS(1 / scale, 1 / scale)
+        local position = boundWindow(window.Visible and canvas.Position or window.HomePosition or canvas.Position, false)
+        window.HomePosition = window.HomePosition and position or nil
+        canvas.Position = position
+        mobileGui.Enabled = opts.MobileToggle == true or (opts.MobileToggle ~= false and UserInputService.TouchEnabled)
+        touchResize.Visible = UserInputService.TouchEnabled
+        touchResize.Size = UFO(44 / scale, 44 / scale)
+        mobileButton.Position = boundButton(mobileButton.Position)
+    end
+    local buttonStart, pointerStart, moved = UFO(12, 12), Vector3.zero, false
+    BindPointerDrag(mobileButton, function(input)
+        buttonStart, pointerStart, moved = mobileButton.Position, input.Position, false
+    end, function(input)
+        local delta = input.Position - pointerStart
+        if delta.X * delta.X + delta.Y * delta.Y >= 36 then moved = true end
+        if moved then
+            mobileButton.Position = boundButton(UFO(buttonStart.X.Offset + delta.X, buttonStart.Y.Offset + delta.Y))
+        end
+    end)
+    Connect(mobileButton.Activated, function()
+        if not moved then window:Toggle() end
+    end)
+    MakeDraggable(header, canvas, boundWindow)
+    MakeResizable(resize, canvas, opts.MinSize or V2(420, 320))
+    MakeResizable(touchResize, canvas, opts.MinSize or V2(420, 320))
+    Connect(screenGui:GetPropertyChangedSignal("AbsoluteSize"), updateFit)
+    Connect(mobileGui:GetPropertyChangedSignal("AbsoluteSize"), function()
+        mobileButton.Position = boundButton(mobileButton.Position)
+    end)
+    Connect(canvas:GetPropertyChangedSignal("Size"), updateFit)
+    Connect(UserInputService:GetPropertyChangedSignal("TouchEnabled"), updateFit)
+    updateFit()
 
 	-- open/close keybind
 	local toggleKey = opts.Keybind or EKC.RightShift
@@ -3427,6 +3561,10 @@ function Callisto:Unload()
         entry.CallbackRunning = false
     end
     table.clear(CallbackContexts)
+    for scroller, saved in pairs(DragScrollers) do
+        if scroller.Parent then scroller.ScrollingEnabled = saved.Enabled end
+    end
+    table.clear(DragScrollers)
     local tweens = {}
     for tween in pairs(ActiveTweens) do TIS(tweens, tween) end
     for _, tween in ipairs(tweens) do
